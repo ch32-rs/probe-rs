@@ -114,6 +114,8 @@ pub enum RiscvChip {
     CH32L103 = 0x0E, // 14
     /// CH641 Qingke-V2A series, USB-PD, fallback as CH32V003
     CH641 = 0x49,
+    /// CH32V00X Qingke-V2C series (V002/V004/V005/V006/V007)
+    CH32V00X = 0x4e,
 }
 
 impl RiscvChip {
@@ -132,6 +134,7 @@ impl RiscvChip {
             0x0D => Some(RiscvChip::CH32X035),
             0x0E => Some(RiscvChip::CH32L103),
             0x49 => Some(RiscvChip::CH641),
+            0x4E => Some(RiscvChip::CH32V00X),
             _ => None,
         }
     }
@@ -258,6 +261,16 @@ impl WchLink {
         self.name = format!("{} v{}.{}", self.variant, self.v_major, self.v_minor);
 
         Ok(())
+    }
+
+    /// `chip_id` reported by the probe's `AttachChip`; zero before attach.
+    pub fn chip_id(&self) -> u32 {
+        self.chip_id
+    }
+
+    /// Chip family reported by the probe's `AttachChip`.
+    pub fn chip_family(&self) -> RiscvChip {
+        self.chip_family
     }
 
     fn dmi_op_read(&mut self, addr: u8) -> Result<(u8, u32, u8), DebugProbeError> {
