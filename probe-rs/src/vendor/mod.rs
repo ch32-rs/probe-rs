@@ -70,6 +70,15 @@ pub trait Vendor: Send + Sync + std::fmt::Display {
     ) -> Result<Option<String>, Error> {
         Ok(None)
     }
+
+    /// Tries to identify a chip from probe-firmware-side metadata. Returns `Some(target name)` on success.
+    fn try_detect_chip_from_probe(
+        &self,
+        _registry: &Registry,
+        _probe: &mut Probe,
+    ) -> Result<Option<String>, Error> {
+        Ok(None)
+    }
 }
 
 static VENDORS: LazyLock<RwLock<Vec<&'static dyn Vendor>>> = LazyLock::new(|| {
@@ -283,6 +292,18 @@ fn try_detect_xtensa_chip(registry: &Registry, probe: &mut Probe) -> Result<Opti
     Ok(found_target)
 }
 
+fn try_detect_from_probe(
+    registry: &Registry,
+    probe: &mut Probe,
+) -> Result<Option<Target>, Error> {
+    for vendor in vendors().iter() {
+        if let Some(target_name) = vendor.try_detect_chip_from_probe(registry, probe)? {
+            return Ok(Some(registry.get_target_by_name(target_name)?));
+        }
+    }
+    Ok(None)
+}
+
 /// Tries to identify the chip using the given probe.
 pub(crate) fn auto_determine_target(
     registry: &Registry,
@@ -294,6 +315,13 @@ pub(crate) fn auto_determine_target(
     // Xtensa and RISC-V interfaces don't need moving the probe. For clarity, their
     // handlers work with the borrowed probe, and we use these wrappers to adapt to the
     // ARM way of moving in and out of the probe.
+    fn try_detect_from_probe_wrapper(
+        registry: &Registry,
+        mut probe: Probe,
+    ) -> Result<(Probe, Option<Target>), Error> {
+        try_detect_from_probe(registry, &mut probe).map(|found_target| (probe, found_target))
+    }
+
     fn try_detect_riscv_chip_wrapper(
         registry: &Registry,
         mut probe: Probe,
@@ -313,6 +341,7 @@ pub(crate) fn auto_determine_target(
         try_detect_arm_chip,
         try_detect_riscv_chip_wrapper,
         try_detect_xtensa_chip_wrapper,
+        try_detect_from_probe_wrapper,
     ];
 
     for architecture in ARCHITECTURES {
