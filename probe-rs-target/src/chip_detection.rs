@@ -30,6 +30,9 @@ pub enum ChipDetectionMethod {
 
     /// Renesas RA chip detection information.
     RenesasPnr(RenesasPnrDetection),
+
+    /// WCH-Link probe-firmware-based chip detection.
+    WchLink(WchLinkDetection),
 }
 
 impl ChipDetectionMethod {
@@ -90,6 +93,15 @@ impl ChipDetectionMethod {
     /// Returns the Renesas detection information if available.
     pub fn as_renesas_pnr(&self) -> Option<&RenesasPnrDetection> {
         if let Self::RenesasPnr(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the WCH-Link detection information if available.
+    pub fn as_wch_link(&self) -> Option<&WchLinkDetection> {
+        if let Self::WchLink(v) = self {
             Some(v)
         } else {
             None
@@ -217,4 +229,42 @@ pub struct RenesasPnrDetection {
 
     /// Chip part number
     pub variants: Vec<String>,
+}
+
+/// WCH-Link probe-firmware-based chip detection information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WchLinkDetection {
+    /// Mask applied to the probe's `chip_id` before lookup.
+    #[serde(serialize_with = "hex_u_int")]
+    pub mask: u32,
+
+    /// `(chip_id & mask)` => Target name.
+    #[serde(serialize_with = "hex_keys_indexmap")]
+    #[serde(deserialize_with = "maps_duplicate_key_is_error::deserialize")]
+    pub variants: IndexMap<u32, String>,
+
+    /// Optional post-attach OB refinement keyed by `(chip_id & mask)`.
+    #[serde(default)]
+    #[serde(serialize_with = "hex_keys_indexmap")]
+    #[serde(deserialize_with = "maps_duplicate_key_is_error::deserialize")]
+    pub ob_refinement: IndexMap<u32, ObRefinement>,
+}
+
+/// Refines a WCH variant by reading one option byte over the debug interface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObRefinement {
+    /// Flash address of the OB byte to read.
+    #[serde(serialize_with = "hex_u_int")]
+    pub address: u64,
+
+    /// Bitmask applied to the read byte before lookup.
+    #[serde(serialize_with = "hex_u_int")]
+    pub mask: u8,
+
+    /// `(read_byte & mask)` => refined Target name.
+    #[serde(serialize_with = "hex_keys_indexmap")]
+    #[serde(deserialize_with = "maps_duplicate_key_is_error::deserialize")]
+    pub variants: IndexMap<u8, String>,
 }
