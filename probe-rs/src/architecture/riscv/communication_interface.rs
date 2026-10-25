@@ -1061,8 +1061,8 @@ impl<'state> RiscvCommunicationInterface<'state> {
         tracing::debug!("Number of dscratch registers: {}", self.state.nscratch);
 
         // determine if autoexec works
+        // The memory paths only use `autoexecdata`, so ignore the progbuf variant.
         let mut abstractauto = Abstractauto(0);
-        abstractauto.set_autoexecprogbuf(2u32.pow(self.state.progbuf_size as u32) - 1);
         abstractauto.set_autoexecdata(2u32.pow(self.state.data_register_count as u32) - 1);
 
         self.schedule_write_dm_register(abstractauto)?;
