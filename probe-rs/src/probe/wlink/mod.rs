@@ -117,6 +117,8 @@ pub enum RiscvChip {
     CH32V317 = 0x86,
     /// CH570/CH572 Qingke-V3C series
     CH570 = 0x8B,
+    /// CH32V407/CH32V467 Qingke-V4F series
+    CH32V4X7 = 0xA6,
     /// CH32H4 Qingke-V4F high-performance series (H415/H416/H417)
     CH32H4 = 0xC6,
 }
@@ -142,12 +144,15 @@ impl RiscvChip {
             0x4E => Some(RiscvChip::CH32V00X),
             0x86 => Some(RiscvChip::CH32V317),
             0x8B => Some(RiscvChip::CH570),
+            0xA6 => Some(RiscvChip::CH32V4X7),
             0xC6 => Some(RiscvChip::CH32H4),
             _ => None,
         }
     }
 
     fn support_flash_protect(&self) -> bool {
+        // This also opts into automatic unprotect on attach. Keep V4x7 out
+        // until its flash/protection workflow is supported and validated.
         matches!(
             self,
             RiscvChip::CH32V103

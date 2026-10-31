@@ -365,7 +365,38 @@ impl WchLinkCommand for UnprotectFlash {
 
 #[cfg(test)]
 mod tests {
-    use super::{SetRstPin, WchLinkCommand};
+    use super::{
+        AttachChipResponse, RiscvChip, SetRstPin, SetSpeed, Speed, WchLinkCommand,
+        WchLinkCommandResponse, WchLinkError,
+    };
+
+    #[test]
+    fn attach_v4x7() {
+        let response = AttachChipResponse::from_payload(&[0xa6, 0x46, 0x74, 0x00, 0x11]).unwrap();
+        assert_eq!(response.chip_family, RiscvChip::CH32V4X7);
+        assert_eq!(response.riscvchip, 0xa6);
+        assert_eq!(response.chip_id, 0x4674_0011);
+        assert!(!response.chip_family.support_flash_protect());
+    }
+
+    #[test]
+    fn attach_unknown_family_still_fails() {
+        assert!(matches!(
+            AttachChipResponse::from_payload(&[0xff, 0x46, 0x74, 0x00, 0x01]),
+            Err(WchLinkError::UnknownChip(0xff))
+        ));
+    }
+
+    #[test]
+    fn set_v4x7_speed_bytes() {
+        let speed = Speed::from_khz(1000).unwrap();
+        let command = SetSpeed(RiscvChip::CH32V4X7, speed);
+        let mut buffer = [0u8; 8];
+        let len = command.to_bytes(&mut buffer).unwrap();
+        assert_eq!(buffer[0..4], [0x81, 0x0c, 0x02, 0xa6]);
+        assert_eq!(len, 5);
+        assert_eq!(buffer[4], speed as u8);
+    }
 
     #[test]
     fn set_rst_pin_bytes() {
