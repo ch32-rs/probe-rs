@@ -1,5 +1,7 @@
 //! WCH-LinkRV commands
 
+use std::time::Duration;
+
 use super::{DMI_OP_NOP, DMI_OP_READ, DMI_OP_WRITE, RiscvChip, WchLinkError, WchLinkVariant};
 
 /// Only part of commands are implemented
@@ -19,6 +21,7 @@ pub enum CommandId {
 
 pub(crate) trait WchLinkCommand {
     const COMMAND_ID: CommandId;
+    const TIMEOUT: Duration = Duration::from_millis(100);
     type Response: WchLinkCommandResponse;
 
     fn payload(&self) -> Vec<u8>;
@@ -158,6 +161,7 @@ impl WchLinkCommandResponse for AttachChipResponse {
 
 impl WchLinkCommand for AttachChip {
     const COMMAND_ID: CommandId = CommandId::Control;
+    const TIMEOUT: Duration = Duration::from_secs(1);
     type Response = AttachChipResponse;
 
     fn payload(&self) -> Vec<u8> {
