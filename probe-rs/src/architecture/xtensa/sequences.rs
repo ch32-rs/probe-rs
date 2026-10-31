@@ -4,6 +4,7 @@ use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use crate::architecture::xtensa::Xtensa;
 use crate::architecture::xtensa::communication_interface::XtensaCommunicationInterface;
+use crate::flashing::DebugFlashSequence;
 use crate::semihosting::{SemihostingCommand, UnknownCommandDetails};
 
 /// A interface to operate debug sequences for Xtensa targets.
@@ -46,7 +47,7 @@ pub trait XtensaDebugSequence: Send + Sync + Debug {
         Ok(Some(SemihostingCommand::Unknown(details)))
     }
 
-    /// This ARM sequence is called if an image was flashed to RAM directly. It should perform the
+    /// This sequence is called if an image was flashed to RAM directly. It should perform the
     /// necessary preparation to run that image on the core with the ID passed to the function.
     ///
     /// The core should already be `reset_and_halt`ed right before this call.
@@ -59,6 +60,28 @@ pub trait XtensaDebugSequence: Send + Sync + Debug {
         Err(crate::Error::NotImplemented(
             "RAM running on Xtensa targets",
         ))
+    }
+
+    /// This sequence is called before an image that boots from RAM is written, after the cores
+    /// that boot from it were reset and halted.
+    fn prepare_loading_to_ram(&self, _session: &mut crate::Session) -> Result<(), crate::Error> {
+        Ok(())
+    }
+
+    /// Return the host-side flash sequence implementation, if any.
+    ///
+    /// Override this to enable host-side flashing for Xtensa targets.
+    /// The default returns `None`.
+    fn debug_flash_sequence(&self) -> Option<Arc<dyn DebugFlashSequence>> {
+        None
+    }
+
+    /// Return the fast flash verification implementation if one exists.
+    ///
+    /// Override this for a target whose flash controller can compute a signature over a
+    /// range of flash. The default returns `None`.
+    fn flash_verify_sequence(&self) -> Option<Arc<dyn crate::flashing::FlashVerify>> {
+        None
     }
 }
 

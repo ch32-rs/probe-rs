@@ -19,8 +19,11 @@ use crate::{
             XtensaCommunicationInterface, XtensaDebugInterfaceState, XtensaError,
         },
     },
-    config::{CoreExt, DebugSequence, RegistryError, Target, TargetSelector, registry::Registry},
+    config::{
+        DebugSequence, MemoryApExt, RegistryError, Target, TargetSelector, registry::Registry,
+    },
     core::{Architecture, CombinedCoreState},
+    memory_port::MemoryAccessPort,
     probe::{
         AttachMethod, DebugProbeError, Probe, ProbeCreationError, WireProtocol,
         fake_probe::FakeProbe, list::Lister,
@@ -73,8 +76,9 @@ pub struct SessionConfig {
 }
 
 enum JtagInterface {
-    Riscv(RiscvDebugInterfaceState),
-    Xtensa(XtensaDebugInterfaceState),
+    // The states are boxed, because they are much larger than the `Unknown` variant.
+    Riscv(Box<RiscvDebugInterfaceState>),
+    Xtensa(Box<XtensaDebugInterfaceState>),
     Unknown,
 }
 
@@ -129,7 +133,7 @@ impl fmt::Debug for ArchitectureInterface {
 impl ArchitectureInterface {
     fn attach<'probe, 'target: 'probe>(
         &'probe mut self,
-        target: &'probe Target,
+        target: &'probe mut Target,
         combined_state: &'probe mut CombinedCoreState,
     ) -> Result<Core<'probe>, Error> {
         match self {
@@ -151,8 +155,8 @@ impl ArchitectureInterface {
             }
             ArchitectureInterface::Jtag(probe, ifaces) => {
                 let idx = combined_state.jtag_tap_index();
-                if let Some(probe) = probe.try_as_jtag_probe() {
-                    probe.select_target(idx)?;
+                if let Some(mut chain) = probe.try_as_jtag_chain() {
+                    chain.select(idx)?;
                 }
                 match &mut ifaces[idx] {
                     JtagInterface::Riscv(state) => {
@@ -202,7 +206,7 @@ impl Session {
 
         // Use ARM DAP path when the target connects via SWD/DAP: either ARM cores or RISC-V cores
         // over mem-AP (e.g. RP235x_riscv).
-        let mut session = if target.default_core().memory_ap().is_some() {
+        let mut session = if target.uses_arm_debug_interface() {
             Self::attach_arm_debug_interface(probe, target, attach_method, permissions, cores)?
         } else {
             Self::attach_jtag(probe, target, attach_method, permissions, cores)?
@@ -238,11 +242,17 @@ impl Session {
             _ => unreachable!("DAP path only used for ARM or RISC-V-over-mem-AP targets"),
         };
 
+        if probe.protocol() == Some(WireProtocol::Jtag) && !target.jtag_reaches_any_core() {
+            return Err(Error::NoCoreOnJtagScanChain(target.name.clone()));
+        }
+
         if AttachMethod::UnderReset == attach_method {
             let _span = tracing::debug_span!("Asserting hardware reset").entered();
 
-            if let Some(dap_probe) = probe.try_as_dap_probe() {
-                sequence_handle.reset_hardware_assert(dap_probe)?;
+            if probe.try_as_swd_probe_mut().is_some()
+                || probe.try_as_jtag_chain_access_mut().is_some()
+            {
+                probe.with_debug_port_wire(|wire| sequence_handle.reset_hardware_assert(wire))?;
             } else {
                 tracing::info!(
                     "Custom reset sequences are not supported on {}.",
@@ -255,19 +265,19 @@ impl Session {
 
         if let Some(jtag) = target.jtag.as_ref()
             && let Some(scan_chain) = jtag.scan_chain.clone()
-            && let Some(probe) = probe.try_as_jtag_probe()
+            && let Some(mut chain) = probe.try_as_jtag_chain()
         {
-            probe.set_expected_scan_chain(&scan_chain)?;
+            chain.set_expected(&scan_chain);
         }
 
         probe.attach_to_unspecified()?;
         if probe.protocol() == Some(WireProtocol::Jtag)
-            && let Some(probe) = probe.try_as_jtag_probe()
-            && let Ok(chain) = probe.scan_chain()
-            && !chain.is_empty()
+            && let Some(mut chain) = probe.try_as_jtag_chain()
+            && let Ok(_) = chain.scan_chain()
+            && !chain.chain().is_empty()
         {
             for core in &cores {
-                probe.select_target(core.jtag_tap_index())?;
+                chain.select(core.jtag_tap_index())?;
             }
         }
 
@@ -431,25 +441,25 @@ impl Session {
         // handle most of the setup in the same way.
         if let Some(jtag) = target.jtag.as_ref()
             && let Some(scan_chain) = jtag.scan_chain.clone()
-            && let Some(probe) = probe.try_as_jtag_probe()
+            && let Some(mut chain) = probe.try_as_jtag_chain()
         {
             if jtag.force_scan_chain {
                 // Bypass JTAG auto-detection entirely; use the scan chain from the target YAML.
                 // This is required for targets whose TAP does not respond to the standard IDCODE
                 // DR scan (e.g., some RISC-V cores during early power-up).
-                probe.set_scan_chain(&scan_chain)?;
+                chain.set_chain(&scan_chain);
             } else {
-                probe.set_expected_scan_chain(&scan_chain)?;
+                chain.set_expected(&scan_chain);
             }
         }
 
         probe.attach_to_unspecified()?;
-        if let Some(probe) = probe.try_as_jtag_probe()
-            && let Ok(chain) = probe.scan_chain()
-            && !chain.is_empty()
+        if let Some(mut chain) = probe.try_as_jtag_chain()
+            && let Ok(_) = chain.scan_chain()
+            && !chain.chain().is_empty()
         {
             for core in &cores {
-                probe.select_target(core.jtag_tap_index())?;
+                chain.select(core.jtag_tap_index())?;
             }
         }
 
@@ -460,9 +470,9 @@ impl Session {
         // FIXME: This is terribly JTAG-specific. Since we don't really support anything else yet,
         // it should be fine for now.
         let highest_idx = cores.iter().map(|c| c.jtag_tap_index()).max().unwrap_or(0);
-        let tap_count = if let Some(probe) = probe.try_as_jtag_probe() {
-            match probe.scan_chain() {
-                Ok(scan_chain) => scan_chain.len().max(highest_idx + 1),
+        let tap_count = if let Some(mut chain) = probe.try_as_jtag_chain() {
+            match chain.scan_chain() {
+                Ok(_) => chain.chain().len().max(highest_idx + 1),
                 Err(_) => highest_idx + 1,
             }
         } else {
@@ -498,9 +508,11 @@ impl Session {
                         interface.enter_debug_mode()?;
                     }
 
-                    JtagInterface::Riscv(state)
+                    JtagInterface::Riscv(Box::new(state))
                 }
-                Architecture::Xtensa => JtagInterface::Xtensa(XtensaDebugInterfaceState::default()),
+                Architecture::Xtensa => {
+                    JtagInterface::Xtensa(Box::new(core.xtensa_interface_state()?))
+                }
                 _ => {
                     return Err(Error::Probe(DebugProbeError::Other(format!(
                         "Unsupported core architecture {core_arch:?}",
@@ -629,6 +641,37 @@ impl Session {
             .ok_or(Error::CoreNotFound(core))
     }
 
+    /// Attaches to a memory access port with the given index number.
+    pub fn memory_access_port(&mut self, index: usize) -> Result<MemoryAccessPort<'_>, Error> {
+        let memory_port = self
+            .target
+            .memory_ports
+            .get(index)
+            .ok_or(Error::MemoryAccessPortNotFound(index))?;
+        match &mut self.interfaces {
+            ArchitectureInterface::Arm(arm_debug_interface) => {
+                let memory_ap = memory_port
+                    .memory_ap()
+                    .ok_or(Error::MemoryAccessPortNotFound(index))?;
+                let memory_interface = arm_debug_interface.memory_interface(&memory_ap)?;
+                Ok(MemoryAccessPort::new_for_arm_memory_interface(
+                    index,
+                    &memory_port.name,
+                    memory_interface,
+                ))
+            }
+            ArchitectureInterface::Jtag(_, _) => Err(Error::NotImplemented(
+                "Memory port access on RISC-V and Xtensa",
+            )),
+            ArchitectureInterface::ArmWithRiscv {
+                arm: _,
+                riscv_mem_ap_cores: _,
+            } => Err(Error::NotImplemented(
+                "Memory port access on ARM with RiscV",
+            )),
+        }
+    }
+
     /// Attaches to the core with the given number.
     ///
     /// ## Usage
@@ -653,7 +696,7 @@ impl Session {
             .ok_or(Error::CoreNotFound(core_index))?;
 
         self.interfaces
-            .attach(&self.target, combined_state)
+            .attach(&mut self.target, combined_state)
             .map_err(|e| {
                 if matches!(
                     e,
@@ -749,8 +792,8 @@ impl Session {
                 }
             }
             ArchitectureInterface::Jtag(probe, ifaces) => {
-                if let Some(probe) = probe.try_as_jtag_probe() {
-                    probe.select_target(tap_idx)?;
+                if let Some(mut chain) = probe.try_as_jtag_chain() {
+                    chain.select(tap_idx)?;
                 }
                 if let JtagInterface::Riscv(state) = &mut ifaces[tap_idx] {
                     let factory = probe.try_get_riscv_interface_builder()?;
@@ -770,8 +813,8 @@ impl Session {
     ) -> Result<XtensaCommunicationInterface<'_>, Error> {
         let tap_idx = self.interface_idx(core_id)?;
         if let ArchitectureInterface::Jtag(probe, ifaces) = &mut self.interfaces {
-            if let Some(probe) = probe.try_as_jtag_probe() {
-                probe.select_target(tap_idx)?;
+            if let Some(mut chain) = probe.try_as_jtag_chain() {
+                chain.select(tap_idx)?;
             }
             if let JtagInterface::Xtensa(state) = &mut ifaces[tap_idx] {
                 return Ok(probe.try_get_xtensa_interface(state)?);
@@ -833,6 +876,21 @@ impl Session {
             }
             DebugSequence::Xtensa(xtensa_debug_sequence) => {
                 xtensa_debug_sequence.prepare_running_on_ram(self, vector_table_addr, core_id)
+            }
+        }
+    }
+
+    /// Prepares the target before an image that boots from RAM is written.
+    pub(crate) fn prepare_loading_to_ram(&mut self) -> Result<(), crate::Error> {
+        match self.target.debug_sequence.clone() {
+            DebugSequence::Arm(arm_debug_sequence) => {
+                arm_debug_sequence.prepare_loading_to_ram(self)
+            }
+            DebugSequence::Riscv(riscv_debug_sequence) => {
+                riscv_debug_sequence.prepare_loading_to_ram(self)
+            }
+            DebugSequence::Xtensa(xtensa_debug_sequence) => {
+                xtensa_debug_sequence.prepare_loading_to_ram(self)
             }
         }
     }
@@ -1085,7 +1143,7 @@ fn get_target_from_selector(
 ) -> Result<(Probe, Target), Error> {
     let target = match target {
         TargetSelector::Unspecified(name) => registry.get_target_by_name(name)?,
-        TargetSelector::Specified(target) => target,
+        TargetSelector::Specified(target) => *target,
         TargetSelector::Auto => {
             // At this point we do not know what the target is, so we cannot use the chip specific reset sequence.
             // Thus, we try just using a normal reset for target detection if we want to do so under reset.

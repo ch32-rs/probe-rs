@@ -13,7 +13,10 @@ use crate::{
     error::Error,
     vendor::{
         Vendor,
-        infineon::sequences::{psoc_edge, xmc4000::XMC4000},
+        infineon::sequences::{
+            psoc_c3::PsocC3, psoc_c3_x7x8::PsocC3X7X8, psoc_edge, tle::InfineonTle,
+            xmc1000::XMC1000, xmc4000::XMC4000,
+        },
     },
 };
 
@@ -30,8 +33,26 @@ impl Vendor for Infineon {
     fn try_create_debug_sequence(&self, chip: &Chip) -> Option<DebugSequence> {
         let sequence = if chip.name.starts_with("XMC4") {
             DebugSequence::Arm(XMC4000::create())
+        } else if chip.name.starts_with("XMC1") {
+            DebugSequence::Arm(XMC1000::create())
         } else if chip.name.starts_with("PSE84") {
             DebugSequence::Arm(psoc_edge::PsocEdge::create(chip))
+        } else if chip.name.starts_with("TLE98") || chip.name.starts_with("TLE99") {
+            // MOTIX™ TLE98xx/TLE99xx motor-control MCUs gate SWD behind their
+            // BootROM and need a special debug-mode entry sequence.
+            DebugSequence::Arm(InfineonTle::create())
+        } else if chip.name.starts_with("PSC3M3")
+            || chip.name.starts_with("PSC3M5")
+            || chip.name.starts_with("PSC3P2")
+            || chip.name.starts_with("PSC3P5")
+        {
+            DebugSequence::Arm(PsocC3::create(chip))
+        } else if chip.name.starts_with("PSC3M7")
+            || chip.name.starts_with("PSC3M8")
+            || chip.name.starts_with("PSC3P7")
+            || chip.name.starts_with("PSC3P8")
+        {
+            DebugSequence::Arm(PsocC3X7X8::create(chip))
         } else {
             return None;
         };
@@ -111,7 +132,7 @@ fn read_xmc4xxx_scu_idchip(memory: &mut dyn ArmMemoryInterface) -> Result<Option
     bitfield::bitfield! {
         /// SCU->ID register.
         #[derive(Copy,Clone)]
-        struct ScuId(u32);
+        struct ScuId(pub u32);
         impl Debug;
         pub mod_rev, _: 7, 0;
         pub mod_type, _: 15, 8;

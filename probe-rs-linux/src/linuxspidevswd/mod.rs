@@ -35,18 +35,12 @@
 //! EOF
 //! ```
 
-use probe_rs::{
-    CoreStatus,
-    architecture::arm::{
-        ArmCommunicationInterface, ArmDebugInterface, ArmError, DapError, DapProbe, RawDapAccess,
-        RegisterAddress,
-        dp::{DpRegister, RdBuff},
-        sequences::ArmDebugSequence,
-    },
-    probe::{
-        DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, ProbeCreationError,
-        ProbeError, ProbeFactory, SwdSettings, WireProtocol,
-    },
+use probe_rs::probe::{
+    BatchError, BatchExecutionError, BitSequence, CommandResult, DebugProbe, DebugProbeError,
+    DebugProbeInfo, DebugProbeSelector, ProbeCreationError, ProbeError, ProbeFactory, Results,
+    SwdSettings, WireProtocol,
+    list::ProbeListItem,
+    swd::{Direction, Port, SwdBatch, SwdOp, SwdProbe, SwdTransferError},
 };
 use spidev::{SpiModeFlags, SpidevOptions, SpidevTransfer};
 use std::fmt::Debug;
@@ -61,8 +55,7 @@ const WRITE_PACKET_SIZE: usize = 8; // 7 byte writes work, but only for slower s
 const READ_PACKET_SIZE: usize = 7;
 /// Maximum number of bytes allowed in a single SPI transaction.
 const MAX_QUEUE_BYTES: usize = 4096;
-const SWD_LINE_RESET_BITS: u8 = 51;
-const SWD_LINE_RESET_ONES: u64 = 0x0007_FFFF_FFFF_FFFF;
+const SWD_LINE_RESET_BITS: usize = 51;
 
 /// A factory for creating [`LinuxSpidevSwdProbe`] instances.
 #[derive(Debug)]
@@ -87,14 +80,14 @@ impl ProbeFactory for LinuxSpidevSwdFactory {
         Ok(Box::new(LinuxSpidevSwdProbe::new(spidev)))
     }
 
-    fn list_probes(&self) -> Vec<DebugProbeInfo> {
+    fn list_probes(&self) -> Vec<ProbeListItem> {
         list_spidev_links()
             .into_iter()
-            .map(|path| probe_info_for_path(&path))
+            .map(|path| ProbeListItem::accessible(probe_info_for_path(&path)))
             .collect()
     }
 
-    fn list_probes_filtered(&self, selector: Option<&DebugProbeSelector>) -> Vec<DebugProbeInfo> {
+    fn list_probes_filtered(&self, selector: Option<&DebugProbeSelector>) -> Vec<ProbeListItem> {
         let Some(selector) = selector else {
             return self.list_probes();
         };
@@ -104,32 +97,128 @@ impl ProbeFactory for LinuxSpidevSwdFactory {
             .as_deref()
             .is_some_and(|serial| is_valid_spidev_path(Path::new(serial)))
         {
-            return vec![probe_info_for_path(Path::new(
+            return vec![ProbeListItem::accessible(probe_info_for_path(Path::new(
                 selector.serial_number.as_deref().unwrap(),
-            ))];
+            )))];
         }
 
         self.list_probes()
             .into_iter()
-            .filter(|probe| selector.matches_probe(probe))
+            .filter(|probe| selector.matches_probe(&probe.info))
             .collect()
     }
 }
 
+/// One write in a [`WriteQueue`].
+#[derive(Debug, Clone, Copy)]
+struct QueuedWrite {
+    /// The byte offset of the packet in the queue.
+    offset: usize,
+    /// The index of the operation in the batch.
+    index: usize,
+}
+
+/// Write packets and idle bytes that go out in one SPI transfer.
+#[derive(Debug, Default)]
+struct WriteQueue {
+    tx: Vec<u8>,
+    writes: Vec<QueuedWrite>,
+}
+
+impl WriteQueue {
+    fn is_empty(&self) -> bool {
+        self.tx.is_empty()
+    }
+
+    /// Returns the bytes that still fit, after the `trailing` idle bytes of the transfer.
+    fn room(&self, trailing: usize) -> usize {
+        MAX_QUEUE_BYTES.saturating_sub(self.tx.len() + trailing)
+    }
+
+    fn push_write(&mut self, index: usize, packet: &[u8]) {
+        self.writes.push(QueuedWrite {
+            offset: self.tx.len(),
+            index,
+        });
+        self.tx.extend_from_slice(packet);
+    }
+
+    /// Queues up to `bytes` idle bytes that fit before `trailing`, and returns the number.
+    fn push_idle(&mut self, bytes: usize, trailing: usize) -> usize {
+        let bytes = bytes.min(self.room(trailing));
+        self.tx.extend(std::iter::repeat_n(0u8, bytes));
+        bytes
+    }
+
+    /// Checks the ACK of every write in `rx`, the bytes received for the queue.
+    ///
+    /// On a failure, returns the batch index of the first write that failed.
+    fn check_acks(&self, rx: &[u8]) -> Result<(), (usize, DebugProbeError)> {
+        for write in &self.writes {
+            let packet = decode_packet(&rx[write.offset..write.offset + WRITE_PACKET_SIZE]);
+            parse_swd_ack(SwdWritePacket(packet).ack()).map_err(|error| (write.index, error))?;
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.tx.clear();
+        self.writes.clear();
+    }
+}
+
+/// Converts the received bytes of one packet to the bit order of the packet bitfields.
+fn decode_packet(bytes: &[u8]) -> u64 {
+    let mut data = [0u8; 8];
+    data[0..bytes.len()].copy_from_slice(bytes);
+    u64::from_be_bytes(data).reverse_bits()
+}
+
+/// A full-duplex SPI bus.
+trait SpiBus: Debug + Send {
+    /// Sets the clock speed in Hz.
+    fn configure(&mut self, speed_hz: u32) -> std::io::Result<()>;
+
+    /// Clocks out `tx` and fills `rx`, of the same length, with the bytes that come back.
+    fn transfer(&mut self, tx: &[u8], rx: &mut [u8]) -> std::io::Result<()>;
+}
+
+impl SpiBus for spidev::Spidev {
+    fn configure(&mut self, speed_hz: u32) -> std::io::Result<()> {
+        let options = SpidevOptions::new()
+            .bits_per_word(8)
+            .max_speed_hz(speed_hz)
+            .mode(SpiModeFlags::SPI_MODE_3)
+            .build();
+        spidev::Spidev::configure(self, &options)
+    }
+
+    fn transfer(&mut self, tx: &[u8], rx: &mut [u8]) -> std::io::Result<()> {
+        // The kernel takes the length from `tx` and writes that many bytes into `rx`.
+        debug_assert_eq!(tx.len(), rx.len());
+        let mut transfer = SpidevTransfer::read_write(tx, rx);
+        spidev::Spidev::transfer(self, &mut transfer)
+    }
+}
+
+fn io_error(error: std::io::Error) -> DebugProbeError {
+    DebugProbeError::ProbeSpecific(LinuxSpidevSwdError::Io(error).into())
+}
+
 /// Probe using Linux spidev to emulate SWD with full-duplex SPI.
 pub struct LinuxSpidevSwdProbe {
-    spidev: spidev::Spidev,
+    bus: Box<dyn SpiBus>,
     speed_khz: u32,
     swd_settings: SwdSettings,
 
-    tx_buffer: Vec<u8>,
+    queue: WriteQueue,
     rx_buffer: Vec<u8>,
 }
 
 impl Debug for LinuxSpidevSwdProbe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LinuxSpidevSwdProbe")
-            .field("spidev", &self.spidev)
+            .field("bus", &self.bus)
             .field("speed_khz", &self.speed_khz)
             .finish_non_exhaustive()
     }
@@ -138,147 +227,109 @@ impl Debug for LinuxSpidevSwdProbe {
 impl LinuxSpidevSwdProbe {
     /// Construct a new spidev SWD probe for the given SPI port.
     pub fn new(spidev: spidev::Spidev) -> Self {
+        Self::with_bus(Box::new(spidev))
+    }
+
+    fn with_bus(bus: Box<dyn SpiBus>) -> Self {
         LinuxSpidevSwdProbe {
-            spidev,
+            bus,
             speed_khz: 1000,
             swd_settings: SwdSettings::default(),
-            tx_buffer: Vec::new(),
+            queue: WriteQueue::default(),
             rx_buffer: vec![0; MAX_QUEUE_BYTES],
         }
     }
 
     /// Configure the spidev device.
     fn configure_spidev(&mut self) -> Result<(), DebugProbeError> {
-        let options = SpidevOptions::new()
-            .bits_per_word(8)
-            .max_speed_hz(self.speed_khz * 1000)
-            .mode(SpiModeFlags::SPI_MODE_3)
-            .build();
-        self.spidev
-            .configure(&options)
-            .map_err(|e| DebugProbeError::ProbeSpecific(LinuxSpidevSwdError::Io(e).into()))
+        self.bus.configure(self.speed_khz * 1000).map_err(io_error)
     }
 
-    /// Transfer the TX buffer, packetize, and fix bit order.
-    fn transfer(&mut self, packet_size: usize) -> Result<impl Iterator<Item = u64>, ArmError> {
-        // Add idle cycles after the transfer as required by SwdSettings.
-        let idle_bytes = self.swd_settings.idle_cycles_after_transfer.div_ceil(8);
-        self.tx_buffer.extend(std::iter::repeat_n(0u8, idle_bytes));
-
-        assert!(packet_size <= 8);
-
-        let rx_buffer = &mut self.rx_buffer[0..self.tx_buffer.len()];
-        let mut transfer = SpidevTransfer::read_write(&self.tx_buffer, rx_buffer);
-
-        let result = self.spidev.transfer(&mut transfer);
-        self.tx_buffer.clear();
-        result.map_err(|e| DebugProbeError::ProbeSpecific(LinuxSpidevSwdError::Io(e).into()))?;
-
-        Ok(rx_buffer.chunks_exact(packet_size).map(move |packet| {
-            let mut data = [0u8; 8];
-            data[0..packet_size].copy_from_slice(packet);
-            u64::from_be_bytes(data).reverse_bits()
-        }))
+    /// Idle bytes that follow every transfer, as `SwdSettings` requires, capped so that one
+    /// write packet still fits in the queue.
+    fn trailing_idle_bytes(&self) -> usize {
+        self.swd_settings
+            .idle_cycles_after_transfer
+            .div_ceil(8)
+            .min(MAX_QUEUE_BYTES - WRITE_PACKET_SIZE)
     }
 
-    /// Flush pending writes in the TX buffer.
-    fn flush_writes(&mut self) -> Result<(), ArmError> {
-        if self.tx_buffer.is_empty() {
+    /// Sends the queued writes and checks their ACKs.
+    ///
+    /// On a failure, returns the batch index of the first write that failed, or `index` if
+    /// the transfer itself failed. The queue is empty afterwards in either case.
+    fn flush_writes(&mut self, index: usize) -> Result<(), (usize, DebugProbeError)> {
+        if self.queue.is_empty() {
             return Ok(());
         }
 
-        // Do the transfer and verify.
-        for packet in self.transfer(WRITE_PACKET_SIZE)? {
-            let response = SwdWritePacket(packet);
-            parse_swd_ack(response.ack())?;
-        }
-
-        Ok(())
+        let index = self.queue.writes.first().map_or(index, |write| write.index);
+        self.queue.push_idle(self.trailing_idle_bytes(), 0);
+        let len = self.queue.tx.len();
+        let result = self
+            .bus
+            .transfer(&self.queue.tx, &mut self.rx_buffer[0..len])
+            .map_err(|e| (index, io_error(e)))
+            .and_then(|()| self.queue.check_acks(&self.rx_buffer[0..len]));
+        self.queue.clear();
+        result
     }
 
     fn transfer_raw_bytes(&mut self, tx: &[u8]) -> Result<(), DebugProbeError> {
         let mut rx = vec![0; tx.len()];
-        let mut transfer = SpidevTransfer::read_write(tx, &mut rx);
-        self.spidev
-            .transfer(&mut transfer)
-            .map_err(|e| DebugProbeError::ProbeSpecific(LinuxSpidevSwdError::Io(e).into()))?;
+        self.bus.transfer(tx, &mut rx).map_err(io_error)
+    }
+
+    fn queue_write(
+        &mut self,
+        index: usize,
+        is_ap: bool,
+        addr: u8,
+        data: u32,
+    ) -> Result<(), (usize, DebugProbeError)> {
+        if self.queue.room(self.trailing_idle_bytes()) < WRITE_PACKET_SIZE {
+            self.flush_writes(index)?;
+        }
+        let packet = SwdWritePacket::new(is_ap, addr, data);
+        let packet = packet.0.reverse_bits().to_be_bytes();
+        self.queue.push_write(index, &packet[0..WRITE_PACKET_SIZE]);
         Ok(())
     }
 
-    fn raw_read_block_internal(
-        &mut self,
-        address: RegisterAddress,
-        values: &mut [u32],
-    ) -> Result<(), ArmError> {
-        // Flush any queued writes.
-        self.flush_writes()?;
-
-        self.tx_buffer
-            .reserve((values.len() + 1) * READ_PACKET_SIZE);
-        let packet = SwdReadPacket::new(address);
-        for _ in 0..values.len() {
-            let packet = packet.0.reverse_bits().to_be_bytes();
-            self.tx_buffer
-                .extend_from_slice(&packet[0..READ_PACKET_SIZE]);
-        }
-
-        if address.is_ap() {
-            // AP reads are pipelined. We need to insert a read to Dap:RDBUFF to get
-            // the actual return value for the final read.
-            let packet = SwdReadPacket::new(RegisterAddress::DpRegister(RdBuff::ADDRESS));
-            let packet = packet.0.reverse_bits().to_be_bytes();
-            self.tx_buffer
-                .extend_from_slice(&packet[0..READ_PACKET_SIZE]);
-        }
-
-        // Do the transfer and read results.
-        let mut i = 0;
-        let mut skip_packet = address.is_ap();
-        for packet in self.transfer(READ_PACKET_SIZE)? {
-            let response = SwdReadPacket(packet);
-            parse_swd_ack(response.ack())?;
-
-            // Check RDATA parity bit.
-            let parity = (response.data().count_ones() & 1) == 1;
-            if parity != response.parity2() {
-                return Err(ArmError::Dap(DapError::IncorrectParity));
+    fn queue_idle(&mut self, index: usize, cycles: u32) -> Result<(), (usize, DebugProbeError)> {
+        let mut remaining = cycles.div_ceil(8) as usize;
+        while remaining > 0 {
+            let queued = self.queue.push_idle(remaining, self.trailing_idle_bytes());
+            if queued == 0 {
+                self.flush_writes(index)?;
             }
-
-            // Possibly skip the first packet.
-            if skip_packet {
-                skip_packet = false;
-                continue;
-            }
-
-            values[i] = response.data();
-            i += 1;
+            remaining -= queued;
         }
-
         Ok(())
     }
 
-    fn raw_write_block_internal(
-        &mut self,
-        address: RegisterAddress,
-        values: &[u32],
-    ) -> Result<(), ArmError> {
-        self.tx_buffer.reserve(values.len() * WRITE_PACKET_SIZE);
-        let mut packet = SwdWritePacket::new(address, 0);
-        for &value in values {
-            SwdWritePacket::update_data(&mut packet, value);
+    /// Sends one read as its own transfer. The queue must be empty.
+    fn transfer_read(&mut self, is_ap: bool, addr: u8) -> Result<u32, DebugProbeError> {
+        debug_assert!(self.queue.is_empty());
+        let packet = SwdReadPacket::new(is_ap, addr);
+        let packet = packet.0.reverse_bits().to_be_bytes();
+        let mut tx = packet[0..READ_PACKET_SIZE].to_vec();
+        tx.extend(std::iter::repeat_n(0u8, self.trailing_idle_bytes()));
+        self.bus
+            .transfer(&tx, &mut self.rx_buffer[0..tx.len()])
+            .map_err(io_error)?;
 
-            let packet = packet.0.reverse_bits().to_be_bytes();
-            self.tx_buffer
-                .extend_from_slice(&packet[0..WRITE_PACKET_SIZE]);
+        let response = SwdReadPacket(decode_packet(&self.rx_buffer[0..READ_PACKET_SIZE]));
+        parse_swd_ack(response.ack())?;
 
-            // If there isn't space for another write packet plus idle cycles, flush the queue.
-            let available = MAX_QUEUE_BYTES - self.tx_buffer.len() - 1;
-            if available < WRITE_PACKET_SIZE {
-                self.flush_writes()?;
-            }
+        let parity = (response.data().count_ones() & 1) == 1;
+        if parity != response.parity2() {
+            return Err(DebugProbeError::SwdTransfer(
+                SwdTransferError::IncorrectParity,
+            ));
         }
 
-        Ok(())
+        Ok(response.data())
     }
 }
 
@@ -327,6 +378,10 @@ impl DebugProbe for LinuxSpidevSwdProbe {
         })
     }
 
+    fn set_reset_line_connected(&mut self, _connected: bool) {
+        // The probe has no reset line.
+    }
+
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {
         if protocol != WireProtocol::Swd {
             Err(DebugProbeError::UnsupportedProtocol(protocol))
@@ -347,17 +402,86 @@ impl DebugProbe for LinuxSpidevSwdProbe {
         true
     }
 
-    fn try_get_arm_debug_interface<'probe>(
-        self: Box<Self>,
-        sequence: std::sync::Arc<dyn ArmDebugSequence>,
-    ) -> Result<Box<dyn ArmDebugInterface + 'probe>, (Box<dyn DebugProbe>, ArmError)> {
-        Ok(ArmCommunicationInterface::create(
-            self, sequence, /* use_overrun_detect*/ false,
-        ))
+    fn try_as_swd_probe(self: Box<Self>) -> Result<Box<dyn SwdProbe>, Box<dyn DebugProbe>> {
+        Ok(self)
     }
 }
 
-impl DapProbe for LinuxSpidevSwdProbe {}
+impl SwdProbe for LinuxSpidevSwdProbe {
+    fn run_batch(
+        &mut self,
+        batch: &SwdBatch,
+    ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
+        let mut results = Results::new();
+
+        for (index, (id, op)) in batch.iter().enumerate() {
+            let at_index = |error| (index, error);
+            let op_result = match op {
+                SwdOp::Transfer {
+                    port,
+                    addr,
+                    direction: Direction::Write,
+                    data,
+                } => self.queue_write(index, *port == Port::Ap, *addr, *data),
+                SwdOp::Transfer {
+                    port,
+                    addr,
+                    direction: Direction::Read,
+                    ..
+                } => self.flush_writes(index).and_then(|()| {
+                    let value = self
+                        .transfer_read(*port == Port::Ap, *addr)
+                        .map_err(at_index)?;
+                    if id.should_capture() {
+                        results.push(id, CommandResult::U32(value));
+                    }
+                    Ok(())
+                }),
+                SwdOp::Sequence(bits) => self.flush_writes(index).and_then(|()| {
+                    self.transfer_raw_bytes(&encode_swj_sequence(bits))
+                        .map_err(at_index)
+                }),
+                SwdOp::Idle { cycles } => self.queue_idle(index, *cycles),
+                SwdOp::Pins { .. } => self.flush_writes(index).and_then(|()| {
+                    Err(at_index(DebugProbeError::NotImplemented {
+                        function_name: "swj_pins",
+                    }))
+                }),
+            };
+
+            if let Err((fault_operation, error)) = op_result {
+                self.queue.clear();
+                return Err(batch_error(error, results, fault_operation));
+            }
+        }
+
+        if let Err((fault_operation, error)) = self.flush_writes(batch.len().saturating_sub(1)) {
+            return Err(batch_error(error, results, fault_operation));
+        }
+
+        Ok(results)
+    }
+
+    fn swd_settings(&self) -> SwdSettings {
+        self.swd_settings.clone()
+    }
+}
+
+/// Reports an SWD transfer error as specific to the batch, and any other error as a probe error.
+fn batch_error(
+    error: DebugProbeError,
+    results: Results,
+    fault_operation: usize,
+) -> BatchExecutionError<DebugProbeError> {
+    match error {
+        DebugProbeError::SwdTransfer(transfer_error) => BatchExecutionError {
+            error: BatchError::Specific(DebugProbeError::SwdTransfer(transfer_error)),
+            results,
+            fault_operation,
+        },
+        error => BatchExecutionError::new_from_debug_probe_at(error, results, fault_operation),
+    }
+}
 
 fn find_matching_device(selector: &DebugProbeSelector) -> Result<PathBuf, DebugProbeError> {
     let Some(serial_number) = selector.serial_number.as_deref() else {
@@ -418,114 +542,26 @@ fn probe_info_for_path(path: &Path) -> DebugProbeInfo {
     )
 }
 
-fn parse_swd_ack(ack: u64) -> Result<(), DapError> {
+fn parse_swd_ack(ack: u64) -> Result<(), DebugProbeError> {
     // These are the little-endian interpretations of bits,
     // so appear backwards relative to the wire order.
     match ack {
         0b001 => Ok(()),
-        0b010 => Err(DapError::WaitResponse),
-        0b100 => Err(DapError::FaultResponse),
-        0b111 => Err(DapError::NoAcknowledge),
-        _ => Err(DapError::Protocol(WireProtocol::Swd)),
-    }
-}
-
-impl RawDapAccess for LinuxSpidevSwdProbe {
-    fn raw_read_register(&mut self, address: RegisterAddress) -> Result<u32, ArmError> {
-        let mut data = 0;
-        match self.raw_read_block_internal(address, std::slice::from_mut(&mut data)) {
-            Ok(()) => Ok(data),
-            Err(ArmError::Dap(DapError::WaitResponse)) => {
-                tracing::debug!("Read from {address:?} got WAIT response, retrying once");
-                self.raw_read_block_internal(address, std::slice::from_mut(&mut data))?;
-                Ok(data)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn raw_write_register(&mut self, address: RegisterAddress, value: u32) -> Result<(), ArmError> {
-        match self.raw_write_block(address, &[value]) {
-            Ok(()) => Ok(()),
-            Err(ArmError::Dap(DapError::WaitResponse)) => {
-                tracing::debug!("Write to {address:?} got WAIT response, retrying once");
-                self.raw_write_block_internal(address, &[value])?;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn raw_read_block(
-        &mut self,
-        address: RegisterAddress,
-        values: &mut [u32],
-    ) -> Result<(), ArmError> {
-        // Flush any queued writes.
-        match self.raw_read_block_internal(address, values) {
-            Ok(()) => Ok(()),
-            Err(ArmError::Dap(DapError::WaitResponse)) => {
-                tracing::debug!("Read from {address:?} got WAIT response, retrying once");
-                self.raw_read_block_internal(address, values)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn raw_write_block(
-        &mut self,
-        address: RegisterAddress,
-        values: &[u32],
-    ) -> Result<(), ArmError> {
-        match self.raw_write_block_internal(address, values) {
-            Ok(()) => Ok(()),
-            Err(ArmError::Dap(DapError::WaitResponse)) => {
-                tracing::debug!("Write to {address:?} got WAIT response, retrying once");
-                self.raw_write_block_internal(address, values)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn raw_flush(&mut self) -> Result<(), ArmError> {
-        self.flush_writes()
-    }
-
-    fn jtag_sequence(&mut self, _cycles: u8, _tms: bool, _tdi: u64) -> Result<(), DebugProbeError> {
-        Err(DebugProbeError::NotImplemented {
-            function_name: "jtag_sequence",
-        })
-    }
-
-    fn swj_sequence(&mut self, bit_len: u8, bits: u64) -> Result<(), DebugProbeError> {
-        let tx = encode_swj_sequence(bit_len, bits);
-        self.transfer_raw_bytes(&tx)
-    }
-
-    fn swj_pins(
-        &mut self,
-        _pin_out: u32,
-        _pin_select: u32,
-        _pin_wait: u32,
-    ) -> Result<u32, DebugProbeError> {
-        Err(DebugProbeError::NotImplemented {
-            function_name: "swj_pins",
-        })
-    }
-
-    fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
-        self
-    }
-
-    fn core_status_notification(&mut self, _state: CoreStatus) -> Result<(), DebugProbeError> {
-        Ok(())
+        0b010 => Err(DebugProbeError::SwdTransfer(SwdTransferError::WaitResponse)),
+        0b100 => Err(DebugProbeError::SwdTransfer(
+            SwdTransferError::FaultResponse,
+        )),
+        0b111 => Err(DebugProbeError::SwdTransfer(
+            SwdTransferError::NoAcknowledge,
+        )),
+        _ => Err(DebugProbeError::SwdTransfer(SwdTransferError::Protocol)),
     }
 }
 
 bitfield::bitfield! {
     /// A SWD write packet
     #[derive(Copy, Clone)]
-    struct SwdWritePacket(u64);
+    struct SwdWritePacket(pub u64);
     impl Debug;
 
     // Common header
@@ -549,7 +585,7 @@ bitfield::bitfield! {
 bitfield::bitfield! {
     /// A SWD read packet
     #[derive(Copy, Clone)]
-    struct SwdReadPacket(u64);
+    struct SwdReadPacket(pub u64);
     impl Debug;
 
     // Common header
@@ -571,36 +607,31 @@ bitfield::bitfield! {
 }
 
 impl SwdWritePacket {
-    fn new(address: RegisterAddress, data: u32) -> Self {
+    fn new(is_ap: bool, addr: u8, data: u32) -> Self {
         let mut packet = SwdWritePacket(0);
         packet.set_start(true);
-        packet.set_ap_n_dp(address.is_ap());
+        packet.set_ap_n_dp(is_ap);
         packet.set_r_n_w(false);
-        packet.set_a2(address.a2());
-        packet.set_a3(address.a3());
-        packet.set_parity1(address.is_ap() ^ false ^ address.a2() ^ address.a3());
+        packet.set_a2((addr & 0b0100) != 0);
+        packet.set_a3((addr & 0b1000) != 0);
+        packet.set_parity1(is_ap ^ false ^ packet.a2() ^ packet.a3());
         packet.set_stop(false);
         packet.set_park(true);
         packet.set_data(data);
         packet.set_parity2((data.count_ones() & 1) == 1);
         packet
     }
-
-    fn update_data(this: &mut Self, data: u32) {
-        this.set_data(data);
-        this.set_parity2((data.count_ones() & 1) == 1);
-    }
 }
 
 impl SwdReadPacket {
-    fn new(address: RegisterAddress) -> Self {
+    fn new(is_ap: bool, addr: u8) -> Self {
         let mut packet = SwdReadPacket(0);
         packet.set_start(true);
-        packet.set_ap_n_dp(address.is_ap());
+        packet.set_ap_n_dp(is_ap);
         packet.set_r_n_w(true);
-        packet.set_a2(address.a2());
-        packet.set_a3(address.a3());
-        packet.set_parity1(address.is_ap() ^ true ^ address.a2() ^ address.a3());
+        packet.set_a2((addr & 0b0100) != 0);
+        packet.set_a3((addr & 0b1000) != 0);
+        packet.set_parity1(is_ap ^ true ^ packet.a2() ^ packet.a3());
         packet.set_stop(false);
         packet.set_park(true);
         packet
@@ -622,43 +653,61 @@ impl core::fmt::Display for LinuxSpidevSwdError {
 
 impl ProbeError for LinuxSpidevSwdError {}
 
-fn encode_swj_sequence(bit_len: u8, bits: u64) -> Vec<u8> {
-    assert!(bit_len <= 64);
-
+fn encode_swj_sequence(bits: &BitSequence) -> Vec<u8> {
+    let bit_len = bits.len();
     if bit_len == 0 {
         return Vec::new();
     }
 
-    if is_line_reset_pattern(bit_len, bits) {
+    if is_line_reset_pattern(bits) {
+        // The high phase extends to the byte boundary. Only the requested idle cycles
+        // stay low.
         let send_bits = bit_len.div_ceil(8) * 8;
-        let remaining_low_cycles = bit_len.saturating_sub(SWD_LINE_RESET_BITS);
-        let reset_sequence = 0xFFFF_FFFF_FFFF_FFFF_u64 >> (64 - send_bits + remaining_low_cycles);
+        let high_bits = send_bits - (bit_len - SWD_LINE_RESET_BITS);
 
-        let mut tx: Vec<u8> =
-            reset_sequence.to_le_bytes()[0..bit_len.div_ceil(8) as usize].to_vec();
-        tx = tx.into_iter().map(|b: u8| b.reverse_bits()).collect();
-        return tx;
+        let mut tx = vec![0u8; send_bits / 8];
+        for i in 0..high_bits {
+            tx[i / 8] |= 1 << (i % 8);
+        }
+        return tx.into_iter().map(|byte| byte.reverse_bits()).collect();
     }
 
-    let mut tx: Vec<u8> = bits.to_le_bytes()[0..bit_len.div_ceil(8) as usize].to_vec();
-    tx = tx.into_iter().map(|b: u8| b.reverse_bits()).collect();
-    tx
+    let mut tx = vec![0u8; bit_len.div_ceil(8)];
+    for i in 0..bit_len {
+        if bits[i] {
+            tx[i / 8] |= 1 << (i % 8);
+        }
+    }
+    tx.into_iter().map(|byte| byte.reverse_bits()).collect()
 }
 
-fn is_line_reset_pattern(bit_len: u8, bits: u64) -> bool {
+fn is_line_reset_pattern(bits: &BitSequence) -> bool {
+    let bit_len = bits.len();
     if bit_len < SWD_LINE_RESET_BITS {
         return false;
     }
 
-    let lower_bits_are_ones = (bits & SWD_LINE_RESET_ONES) == SWD_LINE_RESET_ONES;
-    let upper_bits_are_zero = (bits >> SWD_LINE_RESET_BITS) == 0;
-
-    lower_bits_are_ones && upper_bits_are_zero
+    for i in 0..SWD_LINE_RESET_BITS {
+        if !bits[i] {
+            return false;
+        }
+    }
+    for i in SWD_LINE_RESET_BITS..bit_len {
+        if bits[i] {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    const SWD_LINE_RESET_ONES: u64 = 0x0007_FFFF_FFFF_FFFF;
 
     #[test]
     fn probe_info_uses_spidev_path_as_serial() {
@@ -699,23 +748,176 @@ mod tests {
         let probes = LinuxSpidevSwdFactory.list_probes_filtered(Some(&selector));
 
         assert_eq!(probes.len(), 1);
-        assert_eq!(probes[0].serial_number.as_deref(), Some("/dev/spidev0.0"));
+        assert_eq!(
+            probes[0].info.serial_number.as_deref(),
+            Some("/dev/spidev0.0")
+        );
+    }
+
+    /// The bytes that a target returns for a write with `ack`, in wire order.
+    fn write_reply(ack: u64) -> Vec<u8> {
+        let mut packet = SwdWritePacket(0);
+        packet.set_ack(ack);
+        packet.0.reverse_bits().to_be_bytes()[0..WRITE_PACKET_SIZE].to_vec()
+    }
+
+    /// A queue of two writes, at batch indices 0 and 2, with one idle byte between them.
+    fn two_writes() -> WriteQueue {
+        let mut queue = WriteQueue::default();
+        queue.push_write(0, &[0; WRITE_PACKET_SIZE]);
+        queue.push_idle(1, 0);
+        queue.push_write(2, &[0; WRITE_PACKET_SIZE]);
+        queue
+    }
+
+    #[test]
+    fn acks_are_read_at_each_write_after_idle_bytes() {
+        let queue = two_writes();
+        let mut rx = write_reply(0b001);
+        rx.push(0);
+        rx.extend(write_reply(0b001));
+        assert!(queue.check_acks(&rx).is_ok());
+    }
+
+    #[test]
+    fn the_earliest_failure_is_reported() {
+        let queue = two_writes();
+        let mut rx = write_reply(0b010);
+        rx.push(0);
+        rx.extend(write_reply(0b100));
+        assert!(matches!(
+            queue.check_acks(&rx),
+            Err((
+                0,
+                DebugProbeError::SwdTransfer(SwdTransferError::WaitResponse)
+            ))
+        ));
+    }
+
+    /// A bus that records every transfer. It answers with the next scripted reply, or with an
+    /// OK for a write packet at every multiple of `stride` bytes.
+    #[derive(Debug)]
+    struct FakeBus {
+        sent: Arc<Mutex<Vec<usize>>>,
+        replies: VecDeque<Vec<u8>>,
+        stride: usize,
+    }
+
+    impl FakeBus {
+        fn new(replies: impl IntoIterator<Item = Vec<u8>>, stride: usize) -> Self {
+            Self {
+                sent: Arc::default(),
+                replies: replies.into_iter().collect(),
+                stride,
+            }
+        }
+    }
+
+    impl SpiBus for FakeBus {
+        fn configure(&mut self, _speed_hz: u32) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn transfer(&mut self, tx: &[u8], rx: &mut [u8]) -> std::io::Result<()> {
+            self.sent.lock().unwrap().push(tx.len());
+            let reply = self.replies.pop_front().unwrap_or_else(|| {
+                let mut write = write_reply(0b001);
+                write.resize(self.stride, 0);
+                write.repeat(tx.len().div_ceil(self.stride))
+            });
+            rx.copy_from_slice(&reply[0..rx.len()]);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_wait_on_a_queued_write_stops_the_batch_at_that_write() {
+        let mut reply = write_reply(0b001);
+        reply.push(0);
+        reply.extend(write_reply(0b010));
+        reply.push(0);
+        let bus = FakeBus::new([reply], WRITE_PACKET_SIZE);
+        let sent = bus.sent.clone();
+        let mut probe = LinuxSpidevSwdProbe::with_bus(Box::new(bus));
+
+        let mut batch = SwdBatch::new();
+        batch.write(Port::Dp, 0x8, 1);
+        batch.idle(2);
+        batch.write(Port::Dp, 0x8, 2);
+        let _ = batch.read(Port::Dp, 0x0);
+        let error = probe.run_batch(&batch).unwrap_err();
+
+        assert_eq!(error.fault_operation, 2);
+        assert!(matches!(
+            error.error,
+            BatchError::Specific(DebugProbeError::SwdTransfer(SwdTransferError::WaitResponse))
+        ));
+        // The writes, the idle byte and the trailing idle byte; the read is not sent.
+        assert_eq!(*sent.lock().unwrap(), [18]);
+    }
+
+    #[test]
+    fn a_full_queue_is_sent_before_the_next_write() {
+        // Each write is followed by one idle byte, as `SwdPort` schedules them.
+        let bus = FakeBus::new([], WRITE_PACKET_SIZE + 1);
+        let sent = bus.sent.clone();
+        let mut probe = LinuxSpidevSwdProbe::with_bus(Box::new(bus));
+
+        let mut batch = SwdBatch::new();
+        for value in 0..600 {
+            batch.write(Port::Ap, 0xC, value);
+            batch.idle(2);
+        }
+        probe.run_batch(&batch).unwrap();
+
+        // 455 writes with their idle bytes and the trailing idle byte fill the queue exactly;
+        // the other 145 follow.
+        assert_eq!(*sent.lock().unwrap(), [455 * 9 + 1, 145 * 9 + 1]);
+    }
+
+    #[test]
+    fn a_wait_names_the_write_that_got_it() {
+        let queue = two_writes();
+        let mut rx = write_reply(0b001);
+        rx.push(0);
+        rx.extend(write_reply(0b010));
+        assert!(matches!(
+            queue.check_acks(&rx),
+            Err((
+                2,
+                DebugProbeError::SwdTransfer(SwdTransferError::WaitResponse)
+            ))
+        ));
+    }
+
+    #[test]
+    fn idle_bytes_stop_at_the_queue_limit() {
+        let mut queue = WriteQueue::default();
+        assert_eq!(queue.push_idle(MAX_QUEUE_BYTES, 1), MAX_QUEUE_BYTES - 1);
+        assert_eq!(queue.room(1), 0);
+        assert_eq!(queue.push_idle(8, 1), 0);
     }
 
     #[test]
     fn encode_swj_sequence_matches_switch_bytes() {
-        assert_eq!(encode_swj_sequence(16, 0xE79E), vec![0x79, 0xE7]);
+        assert_eq!(
+            encode_swj_sequence(&BitSequence::from_u64(16, 0xE79E)),
+            vec![0x79, 0xE7]
+        );
     }
 
     #[test]
     fn encode_swj_sequence_rounds_line_reset_up_with_high_padding() {
-        assert_eq!(encode_swj_sequence(51, SWD_LINE_RESET_ONES), vec![0xFF; 7]);
+        assert_eq!(
+            encode_swj_sequence(&BitSequence::from_u64(51, SWD_LINE_RESET_ONES)),
+            vec![0xFF; 7]
+        );
     }
 
     #[test]
     fn encode_swj_sequence_rounds_line_reset_low_suffix_to_zero_bytes() {
         assert_eq!(
-            encode_swj_sequence(53, SWD_LINE_RESET_ONES),
+            encode_swj_sequence(&BitSequence::from_u64(53, SWD_LINE_RESET_ONES)),
             vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC]
         );
     }

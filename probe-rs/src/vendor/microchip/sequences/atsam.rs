@@ -5,11 +5,12 @@ use crate::{
     architecture::arm::{
         ArmDebugInterface, ArmError, FullyQualifiedApAddress, Pins,
         armv7m::Dhcsr,
-        communication_interface::{DapProbe, SwdSequence},
+        communication_interface::{SwdSequence, raw_pin_levels},
         memory::ArmMemoryInterface,
         sequences::{ArmDebugSequence, ArmDebugSequenceError, DebugEraseSequence},
+        traits::DebugPortWire,
     },
-    probe::DebugProbeError,
+    probe::{BitSequence, DebugProbeError},
     session::MissingPermissions,
 };
 use bitfield::bitfield;
@@ -23,7 +24,7 @@ use std::{
 bitfield! {
     /// Device Service Unit Control Register, DSU - CTRL
     #[derive(Copy, Clone)]
-    pub struct DsuCtrl(u8);
+    pub struct DsuCtrl(pub u8);
     impl Debug;
     /// Chip-Erase
     ///
@@ -67,7 +68,7 @@ impl From<DsuCtrl> for u8 {
 bitfield! {
     /// Device Service Unit Status A Register, DSU - STATUSA
     #[derive(Copy, Clone)]
-    pub struct DsuStatusA(u8);
+    pub struct DsuStatusA(pub u8);
     impl Debug;
     /// Protection Error
     ///
@@ -130,7 +131,7 @@ impl DsuStatusA {
 bitfield! {
     /// Device Service Unit Status B Register, DSU - STATUSB
     #[derive(Copy, Clone)]
-    pub struct DsuStatusB(u8);
+    pub struct DsuStatusB(pub u8);
     impl Debug;
 
     /// Chip Erase Locked
@@ -190,7 +191,7 @@ impl DsuStatusB {
 bitfield! {
     /// Device Identification, DSU - DID
     #[derive(Copy, Clone, PartialEq, Eq)]
-    pub struct DsuDid(u32);
+    pub struct DsuDid(pub u32);
     impl Debug;
 
     /// The value of this field defines the processor used on the device.
@@ -233,17 +234,20 @@ impl From<DsuDid> for u32 {
     }
 }
 /// A wrapper for different types that can perform SWD Commands (SWJ_Pins SWJ_Sequence)
-struct SwdSequenceShim<'a>(&'a mut dyn DapProbe);
+struct SwdSequenceShim<'a>(&'a mut dyn DebugPortWire);
 
-impl<'a> From<&'a mut dyn DapProbe> for SwdSequenceShim<'a> {
-    fn from(p: &'a mut dyn DapProbe) -> Self {
+impl<'a> From<&'a mut dyn DebugPortWire> for SwdSequenceShim<'a> {
+    fn from(p: &'a mut dyn DebugPortWire) -> Self {
         Self(p)
     }
 }
 
 impl SwdSequence for SwdSequenceShim<'_> {
-    fn swj_sequence(&mut self, bit_len: u8, bits: u64) -> Result<(), DebugProbeError> {
-        self.0.swj_sequence(bit_len, bits)
+    fn swj_sequence(&mut self, bits: &BitSequence) -> Result<(), DebugProbeError> {
+        self.0.swj_sequence(bits).map_err(|error| match error {
+            ArmError::Probe(error) => error,
+            other => DebugProbeError::Other(other.to_string()),
+        })
     }
 
     fn swj_pins(
@@ -252,7 +256,17 @@ impl SwdSequence for SwdSequenceShim<'_> {
         pin_select: u32,
         pin_wait: u32,
     ) -> Result<u32, DebugProbeError> {
-        self.0.swj_pins(pin_out, pin_select, pin_wait)
+        self.0
+            .swj_pins(
+                Pins(pin_out as u8),
+                Pins(pin_select as u8),
+                Duration::from_micros(pin_wait as u64),
+            )
+            .map(raw_pin_levels)
+            .map_err(|error| match error {
+                ArmError::Probe(error) => error,
+                other => DebugProbeError::Other(other.to_string()),
+            })
     }
 }
 
@@ -475,7 +489,7 @@ impl ArmDebugSequence for AtSAM {
     ///
     /// Instead of keeping `nReset` asserted, the device is instead put into CPU Reset Extension
     /// which will keep the CPU Core in reset until manually released by the debugger probe.
-    fn reset_hardware_assert(&self, interface: &mut dyn DapProbe) -> Result<(), ArmError> {
+    fn reset_hardware_assert(&self, interface: &mut dyn DebugPortWire) -> Result<(), ArmError> {
         let mut shim = SwdSequenceShim::from(interface);
         let result = self.reset_hardware_with_extension(&mut shim);
 

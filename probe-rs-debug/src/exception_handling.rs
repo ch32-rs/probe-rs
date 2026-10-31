@@ -57,6 +57,20 @@ pub struct ExceptionInfo {
     pub handler_frame: StackFrame,
 }
 
+/// How the unwinder finds the return address that gives the program counter of the calling frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnAddressRecovery {
+    /// The call frame information restores it, as [DWARF](https://dwarfstd.org) 6.4.4 describes.
+    /// An `Undefined` rule then means the frame has no caller.
+    UnwindInfo,
+    /// The return address register of the called frame already holds it.
+    ///
+    /// Xtensa keeps the return address of a frame in its own `a0`, so a compiler emits no rule to
+    /// restore what it never saved. The register window unwind recovers the `a0` of the calling
+    /// frame instead, which is the return address of that frame, one step too far.
+    CalledFrameRegister,
+}
+
 /// A generic interface to identify and decode exceptions during unwind processing.
 pub trait ExceptionInterface {
     /// Using the `stackframe_registers` for a "called frame",
@@ -105,6 +119,11 @@ pub trait ExceptionInterface {
         Err(DebugError::NotImplemented("exception description"))
     }
 
+    /// How to find the return address that gives the program counter of the calling frame.
+    fn return_address_recovery(&self) -> ReturnAddressRecovery {
+        ReturnAddressRecovery::UnwindInfo
+    }
+
     /// Unwind the stack without debug info.
     ///
     /// This method can be implemented to provide a stack trace using frame pointers, for example.
@@ -135,7 +154,14 @@ pub trait ExceptionInterface {
         _memory: &mut dyn MemoryInterface,
         register_rule: &mut String,
     ) -> Result<Option<RegisterValue>, DebugError> {
-        if debug_register.register_has_role(RegisterRole::FramePointer) {
+        if debug_register.register_has_role(RegisterRole::FramePointer)
+            && debug_register.unwind_rule != UnwindRule::Preserve
+        {
+            // The frame pointer usually has an `Undefined` DWARF rule, in which
+            // case we fall back to FP=CFA. But if it is marked `Preserve` (it is
+            // callee-saved, e.g. R7 in the ARM ABI), the caller's value is simply
+            // whatever the callee left in it, so we must NOT overwrite it with the
+            // CFA. Fall through to the `Preserve` handling below instead.
             *register_rule = "FP=CFA (dwarf Undefined)".to_string();
             return Ok(cfa_as_register(debug_register, unwind_cfa));
         }

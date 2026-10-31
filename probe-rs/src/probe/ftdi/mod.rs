@@ -2,8 +2,7 @@
 use crate::{
     architecture::{
         arm::{
-            ArmCommunicationInterface, ArmDebugInterface, ArmError,
-            communication_interface::DapProbe, sequences::ArmDebugSequence,
+            ArmCommunicationInterface, ArmDebugInterface, ArmError, sequences::ArmDebugSequence,
         },
         riscv::{
             communication_interface::{RiscvError, RiscvInterfaceBuilder},
@@ -14,9 +13,13 @@ use crate::{
         },
     },
     probe::{
-        AutoImplementJtagAccess, DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector,
-        IoSequenceItem, JtagAccess, JtagDriverState, ProbeCreationError, ProbeFactory, RawJtagIo,
-        RawSwdIo, SwdSettings, WireProtocol,
+        BitbangSwd, DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector,
+        IoSequenceItem, JtagChain, JtagChainAccess, JtagChainState, JtagOp, JtagProbe,
+        ProbeCreationError, ProbeFactory, SwdProbe, SwdSettings, WireProtocol,
+        jtag::{Step, TapState, distribute_captures, walk_batch},
+        list::{ProbeListItem, usb_probe_accessibility},
+        queue::{BatchExecutionError, Results},
+        swd::output_levels,
     },
 };
 use bitvec::prelude::*;
@@ -30,6 +33,8 @@ use std::{
 mod command_compacter;
 mod ftdaye;
 
+use crate::probe::Batch;
+
 use command_compacter::Command;
 use ftdaye::{ChipType, error::FtdiError};
 
@@ -38,7 +43,6 @@ struct JtagAdapter {
     device: ftdaye::Device,
     speed_khz: u32,
 
-    command: Command,
     commands: Vec<u8>,
 
     /// For each command that captures bits, stores how many bits are captured.
@@ -86,7 +90,6 @@ impl JtagAdapter {
         Ok(Self {
             device,
             speed_khz: 1000,
-            command: Command::default(),
             commands: vec![],
             in_bit_counts: vec![],
             in_bits: BitVec::new(),
@@ -128,6 +131,8 @@ impl JtagAdapter {
             (0x0403, 0x6010, "Digilent Adept USB Device") => (0x0088, 0x008b),
             // Built-in Digilent HS1 (on-board)
             (0x0403, 0x6010, "Digilent USB Device") => (0x0088, 0x008b),
+            // TinCanTools Flyswatter2
+            (0x0403, 0x6010, "Flyswatter2") => (0x0538, 0x057b),
             // Other devices:
             // TMS starts high
             // TMS, TDO and TCK are outputs
@@ -186,32 +191,31 @@ impl JtagAdapter {
 
         let expected_bits = std::mem::take(&mut self.in_bit_counts);
         let reply_slots = expected_bits.len();
-        let mut reply = Vec::with_capacity(reply_slots);
-        while reply.len() < reply_slots {
+
+        // Read the exact number of bytes that the commands make. A read of more bytes gets only a
+        // status message from the device, and the device sends a status message only one time in
+        // each period of the latency timer. Such a read is therefore very slow.
+        let mut reply = vec![0; reply_slots];
+        let mut received = 0;
+        while received < reply_slots {
             let read = self
                 .device
-                .read_to_end(&mut reply)
+                .read(&mut reply[received..])
                 .map_err(FtdiError::from)?;
+
+            received += read;
 
             if read > 0 {
                 t0 = Instant::now();
             }
 
             if t0.elapsed() > timeout {
-                tracing::warn!("Read {} bytes, expected {}", reply.len(), reply_slots);
+                tracing::warn!("Read {} bytes, expected {}", received, reply_slots);
                 return Err(DebugProbeError::Timeout);
             }
         }
 
-        if reply.len() != reply_slots {
-            return Err(DebugProbeError::Other(format!(
-                "Read more data than expected. Expected {} bytes, got {} bytes",
-                reply_slots,
-                reply.len()
-            )));
-        }
-
-        for (byte, count) in reply.into_iter().zip(expected_bits.into_iter()) {
+        for (byte, count) in reply.into_iter().zip(expected_bits) {
             let bits = byte >> (8 - count);
             self.in_bits
                 .extend_from_bitslice(&bits.view_bits::<Lsb0>()[..count]);
@@ -221,7 +225,6 @@ impl JtagAdapter {
     }
 
     fn flush(&mut self) -> Result<(), DebugProbeError> {
-        self.finalize_command()?;
         self.send_buffer()?;
         self.read_response()?;
 
@@ -242,19 +245,10 @@ impl JtagAdapter {
         Ok(())
     }
 
-    fn finalize_command(&mut self) -> Result<(), DebugProbeError> {
-        if let Some(command) = self.command.take() {
-            self.append_command(command)?;
+    fn append_commands(&mut self, commands: &[Command]) -> Result<(), DebugProbeError> {
+        for command in commands {
+            self.append_command(command.clone())?;
         }
-
-        Ok(())
-    }
-
-    fn shift_bit(&mut self, tms: bool, tdi: bool, capture: bool) -> Result<(), DebugProbeError> {
-        if let Some(command) = self.command.append_jtag_bit(tms, tdi, capture) {
-            self.append_command(command)?;
-        }
-
         Ok(())
     }
 
@@ -284,6 +278,68 @@ impl JtagAdapter {
 
         Ok(std::mem::take(&mut self.in_bits))
     }
+
+    fn run_jtag_batch(
+        &mut self,
+        start: TapState,
+        batch: &Batch<JtagOp, DebugProbeError>,
+    ) -> Result<(TapState, Results), BatchExecutionError<DebugProbeError>> {
+        let (state, commands) = collect_ftdi_commands(start, batch)?;
+        if let Err(error) = self.append_commands(&commands) {
+            return Err(BatchExecutionError::new_from_debug_probe(
+                error,
+                Results::new(),
+            ));
+        }
+
+        if let Err(error) = self.flush() {
+            return Err(BatchExecutionError::new_from_debug_probe(
+                error,
+                Results::new(),
+            ));
+        }
+
+        let captured = match self.read_captured_bits() {
+            Ok(bits) => bits,
+            Err(error) => {
+                return Err(BatchExecutionError::new_from_debug_probe(
+                    error,
+                    Results::new(),
+                ));
+            }
+        };
+
+        let ops: Vec<_> = batch.iter().collect();
+        let results = distribute_captures(ops, &captured, Results::new())?;
+
+        Ok((state, results))
+    }
+}
+
+fn collect_ftdi_commands(
+    start: TapState,
+    batch: &Batch<JtagOp, DebugProbeError>,
+) -> Result<(TapState, Vec<Command>), BatchExecutionError<DebugProbeError>> {
+    let mut state = start;
+    let mut commands = Vec::new();
+    walk_batch(&mut state, batch, |step| {
+        commands.extend(match step {
+            Step::Tms { path, tdi } => Command::encode_tms_path(path, tdi),
+            Step::Shift {
+                data,
+                exit,
+                capture,
+            } => Command::encode_tdi_exchange(data, exit, capture),
+            Step::Clock { count, tms: true } => {
+                Command::encode_tms_path(&vec![true; count as usize], false)
+            }
+            Step::Clock { count, tms: false } => Command::encode_clock_tck(count),
+        });
+        Ok(())
+    })
+    .map_err(|error| BatchExecutionError::new_from_debug_probe(error, Results::new()))?;
+
+    Ok((state, commands))
 }
 
 /// A factory for creating [`FtdiProbe`] instances.
@@ -327,18 +383,18 @@ impl ProbeFactory for FtdiProbeFactory {
 
         let probe = FtdiProbe {
             adapter: JtagAdapter::open(ftdi, probes.pop().unwrap(), selector.interface)?,
-            jtag_state: JtagDriverState::default(),
+            jtag_state: JtagChainState::default(),
             swd_settings: SwdSettings::default(),
         };
         tracing::debug!("opened probe: {:?}", probe);
         Ok(Box::new(probe))
     }
 
-    fn list_probes(&self) -> Vec<DebugProbeInfo> {
+    fn list_probes(&self) -> Vec<ProbeListItem> {
         list_ftdi_devices()
     }
 
-    fn list_probes_filtered(&self, selector: Option<&DebugProbeSelector>) -> Vec<DebugProbeInfo> {
+    fn list_probes_filtered(&self, selector: Option<&DebugProbeSelector>) -> Vec<ProbeListItem> {
         // FTDI probes are enumerated as one entry per USB device. The interface/channel
         // (A/B/C/D) is not stored in DebugProbeInfo; it is a runtime selection passed
         // through to open(). The default list_probes_filtered() filters by interface,
@@ -346,21 +402,17 @@ impl ProbeFactory for FtdiProbeFactory {
         // to select Channel B on an FT2232H, because interface is always None in the
         // listed entries.
         //
-        // Match only on VID, PID, and (optionally) serial number, ignoring interface.
+        // So match as the default does, but ignoring interface.
+        let selector = selector.map(|selector| DebugProbeSelector {
+            interface: None,
+            ..selector.clone()
+        });
         self.list_probes()
             .into_iter()
             .filter(|probe| {
-                selector.as_ref().is_none_or(|s| {
-                    probe.vendor_id == s.vendor_id
-                        && probe.product_id == s.product_id
-                        && s.serial_number.as_ref().is_none_or(|sn| {
-                            if let Some(probe_sn) = &probe.serial_number {
-                                probe_sn == sn
-                            } else {
-                                sn.is_empty()
-                            }
-                        })
-                })
+                selector
+                    .as_ref()
+                    .is_none_or(|s| s.matches_probe(&probe.info))
             })
             .collect()
     }
@@ -370,7 +422,7 @@ impl ProbeFactory for FtdiProbeFactory {
 #[derive(Debug)]
 pub struct FtdiProbe {
     adapter: JtagAdapter,
-    jtag_state: JtagDriverState,
+    jtag_state: JtagChainState,
     swd_settings: SwdSettings,
 }
 
@@ -391,7 +443,7 @@ impl DebugProbe for FtdiProbe {
         tracing::debug!("Attaching...");
 
         self.adapter.attach()?;
-        self.select_target(0)
+        Ok(())
     }
 
     fn detach(&mut self) -> Result<(), crate::Error> {
@@ -418,6 +470,10 @@ impl DebugProbe for FtdiProbe {
         })
     }
 
+    fn set_reset_line_connected(&mut self, _connected: bool) {
+        // The probe has no reset line.
+    }
+
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {
         if protocol != WireProtocol::Jtag {
             Err(DebugProbeError::UnsupportedProtocol(protocol))
@@ -431,7 +487,15 @@ impl DebugProbe for FtdiProbe {
         Some(WireProtocol::Jtag)
     }
 
-    fn try_as_jtag_probe(&mut self) -> Option<&mut dyn JtagAccess> {
+    fn try_as_jtag_chain(&mut self) -> Option<JtagChain<'_>> {
+        Some(JtagChain::new(self))
+    }
+
+    fn try_as_swd_probe_mut(&mut self) -> Option<&mut dyn SwdProbe> {
+        Some(self)
+    }
+
+    fn try_as_jtag_chain_access_mut(&mut self) -> Option<&mut dyn JtagChainAccess> {
         Some(self)
     }
 
@@ -453,7 +517,10 @@ impl DebugProbe for FtdiProbe {
         self: Box<Self>,
         sequence: Arc<dyn ArmDebugSequence>,
     ) -> Result<Box<dyn ArmDebugInterface + 'probe>, (Box<dyn DebugProbe>, ArmError)> {
-        Ok(ArmCommunicationInterface::create(self, sequence, true))
+        let settings = SwdProbe::swd_settings(self.as_ref());
+        Ok(ArmCommunicationInterface::create_jtag(
+            self, settings, sequence, true,
+        ))
     }
 
     fn has_arm_interface(&self) -> bool {
@@ -472,57 +539,42 @@ impl DebugProbe for FtdiProbe {
     }
 }
 
-impl AutoImplementJtagAccess for FtdiProbe {}
-impl DapProbe for FtdiProbe {}
+impl JtagChainAccess for FtdiProbe {
+    fn chain_state(&mut self) -> &mut JtagChainState {
+        &mut self.jtag_state
+    }
 
-impl RawSwdIo for FtdiProbe {
-    fn swd_io<S>(&mut self, _swdio: S) -> Result<Vec<bool>, DebugProbeError>
+    fn chain_state_ref(&self) -> &JtagChainState {
+        &self.jtag_state
+    }
+}
+
+impl JtagProbe for FtdiProbe {
+    fn run_batch(
+        &mut self,
+        batch: &Batch<JtagOp, DebugProbeError>,
+    ) -> Result<Results, BatchExecutionError<DebugProbeError>> {
+        let start = self.jtag_state.tap_state;
+        let (state, results) = self.adapter.run_jtag_batch(start, batch)?;
+        self.jtag_state.tap_state = state;
+        Ok(results)
+    }
+}
+
+impl BitbangSwd for FtdiProbe {
+    fn swd_io<S>(&mut self, swdio: S) -> Result<Vec<bool>, DebugProbeError>
     where
         S: IntoIterator<Item = IoSequenceItem>,
     {
-        Err(DebugProbeError::NotImplemented {
-            function_name: "swd_io",
-        })
-    }
-
-    fn swj_pins(
-        &mut self,
-        _pin_out: u32,
-        _pin_select: u32,
-        _pin_wait: u32,
-    ) -> Result<u32, DebugProbeError> {
-        Err(DebugProbeError::CommandNotSupportedByProbe {
-            command_name: "swj_pins",
-        })
+        let levels = output_levels(swdio)?;
+        self.adapter
+            .append_commands(&Command::encode_tms_path(&levels, false))?;
+        self.adapter.flush()?;
+        Ok(vec![false; levels.len()])
     }
 
     fn swd_settings(&self) -> &SwdSettings {
         &self.swd_settings
-    }
-}
-
-impl RawJtagIo for FtdiProbe {
-    fn shift_bit(
-        &mut self,
-        tms: bool,
-        tdi: bool,
-        capture_tdo: bool,
-    ) -> Result<(), DebugProbeError> {
-        self.jtag_state.state.update(tms);
-        self.adapter.shift_bit(tms, tdi, capture_tdo)?;
-        Ok(())
-    }
-
-    fn read_captured_bits(&mut self) -> Result<BitVec, DebugProbeError> {
-        self.adapter.read_captured_bits()
-    }
-
-    fn state_mut(&mut self) -> &mut JtagDriverState {
-        &mut self.jtag_state
-    }
-
-    fn state(&self) -> &JtagDriverState {
-        &self.jtag_state
     }
 }
 
@@ -647,22 +699,26 @@ static FTDI_COMPAT_DEVICES: &[FtdiDevice] = &[
     },
 ];
 
-fn get_device_info(device: &DeviceInfo) -> Option<DebugProbeInfo> {
+fn get_device_info(device: &DeviceInfo) -> Option<ProbeListItem> {
     FTDI_COMPAT_DEVICES.iter().find_map(|ftdi| {
-        ftdi.matches(device).then(|| DebugProbeInfo {
-            identifier: device.product_string().unwrap_or("FTDI").to_string(),
-            vendor_id: device.vendor_id(),
-            product_id: device.product_id(),
-            serial_number: device.serial_number().map(|s| s.to_string()),
-            probe_factory: &FtdiProbeFactory,
-            is_hid_interface: false,
-            interface: None,
+        ftdi.matches(device).then(|| ProbeListItem {
+            info: DebugProbeInfo {
+                identifier: device.product_string().unwrap_or("FTDI").to_string(),
+                vendor_id: device.vendor_id(),
+                product_id: device.product_id(),
+                serial_number: device.serial_number().map(|s| s.to_string()),
+                probe_factory: &FtdiProbeFactory,
+                is_hid_interface: false,
+                interface: None,
+                usb_location: Some((device.bus_id().to_string(), device.device_address())),
+            },
+            accessibility: usb_probe_accessibility(device),
         })
     })
 }
 
 #[tracing::instrument(skip_all)]
-fn list_ftdi_devices() -> Vec<DebugProbeInfo> {
+fn list_ftdi_devices() -> Vec<ProbeListItem> {
     match nusb::list_devices().wait() {
         Ok(devices) => devices
             .filter_map(|device| get_device_info(&device))
@@ -671,5 +727,166 @@ fn list_ftdi_devices() -> Vec<DebugProbeInfo> {
             tracing::warn!("error listing FTDI devices: {e}");
             vec![]
         }
+    }
+}
+
+#[cfg(test)]
+mod golden_tests {
+    use super::collect_ftdi_commands;
+    use super::command_compacter::decoder::decode_commands_full;
+    use crate::probe::BitSequence;
+    use crate::probe::jtag::golden::{
+        OldJtagState, REGISTER_WRITE_EIGHT_IDLE, SHIFT_DR_ONE_TAP_FORTY_ONE, SHIFT_DR_ONE_TAP_ONE,
+        SHIFT_DR_ONE_TAP_SIXTY_FOUR, SHIFT_DR_ONE_TAP_THIRTY_TWO, SHIFT_DR_THREE_TAP_FORTY_ONE,
+        SHIFT_DR_THREE_TAP_ONE, SHIFT_DR_THREE_TAP_SIXTY_FOUR, SHIFT_DR_THREE_TAP_THIRTY_TWO,
+        SHIFT_IR_ONE_TAP, SHIFT_IR_THREE_TAP, assert_triples_eq, build_dr_exchange,
+        build_ir_exchange, clock_in_every_stable_state, lowering_batch, move_literal,
+        one_tap_params, three_tap_params,
+    };
+    use crate::probe::jtag::{JtagBatch, TapState};
+
+    const STABLE_STATES: [TapState; 6] = [
+        TapState::TestLogicReset,
+        TapState::RunTestIdle,
+        TapState::ShiftIr,
+        TapState::ShiftDr,
+        TapState::PauseIr,
+        TapState::PauseDr,
+    ];
+
+    fn triples_for_batch(start: TapState, batch: &JtagBatch) -> Vec<(bool, bool, bool)> {
+        let (_, commands) = collect_ftdi_commands(start, batch).unwrap();
+        let mut bytes = Vec::new();
+        for command in &commands {
+            command.encode(&mut bytes);
+        }
+        decode_commands_full(&bytes)
+    }
+
+    #[test]
+    fn an_empty_exchange_does_not_shorten_the_next_path() {
+        let mut batch = JtagBatch::new();
+        batch.enter(TapState::ShiftDr);
+        batch.exchange_no_capture(BitSequence::new());
+        batch.enter(TapState::RunTestIdle);
+
+        let mut state = OldJtagState::Idle;
+        for (tms, _, _) in triples_for_batch(TapState::RunTestIdle, &batch) {
+            state.update(tms);
+        }
+        assert_eq!(state, OldJtagState::Idle);
+    }
+
+    #[test]
+    fn clocks_match_the_bitbang_lowering() {
+        let batch = clock_in_every_stable_state();
+        assert_eq!(
+            triples_for_batch(TapState::RunTestIdle, &batch),
+            lowering_batch(TapState::RunTestIdle, &batch)
+        );
+    }
+
+    #[test]
+    fn move_to_state_matches_golden() {
+        for from in STABLE_STATES {
+            for to in STABLE_STATES {
+                if to == TapState::TestLogicReset {
+                    continue;
+                }
+                let mut batch = JtagBatch::new();
+                batch.enter(to);
+                let triples = triples_for_batch(from, &batch);
+                let (tms, tdi, cap) = move_literal(from, to);
+                assert_triples_eq(&triples, tms, tdi, cap);
+            }
+        }
+    }
+
+    #[test]
+    fn shift_ir_matches_golden() {
+        let cases = [
+            (SHIFT_IR_ONE_TAP, one_tap_params()),
+            (SHIFT_IR_THREE_TAP, three_tap_params()),
+        ];
+        for (literal, params) in cases {
+            let mut batch = JtagBatch::new();
+            batch.enter(TapState::ShiftIr);
+            batch.exchange_no_capture(build_ir_exchange(params, 0b10110, 5));
+            batch.enter(TapState::RunTestIdle);
+            let triples = triples_for_batch(TapState::TestLogicReset, &batch);
+            assert_triples_eq(&triples, literal.0, literal.1, literal.2);
+        }
+    }
+
+    #[test]
+    fn shift_dr_matches_golden() {
+        let cases = [
+            (SHIFT_DR_ONE_TAP_ONE, one_tap_params(), &[0x01u8][..], 1),
+            (
+                SHIFT_DR_ONE_TAP_THIRTY_TWO,
+                one_tap_params(),
+                &[0x78, 0x56, 0x34, 0x12],
+                32,
+            ),
+            (
+                SHIFT_DR_ONE_TAP_FORTY_ONE,
+                one_tap_params(),
+                &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+                41,
+            ),
+            (
+                SHIFT_DR_ONE_TAP_SIXTY_FOUR,
+                one_tap_params(),
+                &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11],
+                64,
+            ),
+            (SHIFT_DR_THREE_TAP_ONE, three_tap_params(), &[0x01u8][..], 1),
+            (
+                SHIFT_DR_THREE_TAP_THIRTY_TWO,
+                three_tap_params(),
+                &[0x78, 0x56, 0x34, 0x12],
+                32,
+            ),
+            (
+                SHIFT_DR_THREE_TAP_FORTY_ONE,
+                three_tap_params(),
+                &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+                41,
+            ),
+            (
+                SHIFT_DR_THREE_TAP_SIXTY_FOUR,
+                three_tap_params(),
+                &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11],
+                64,
+            ),
+        ];
+        for (literal, params, bytes, len) in cases {
+            let mut batch = JtagBatch::new();
+            batch.enter(TapState::ShiftDr);
+            batch.exchange_no_capture(build_dr_exchange(params, bytes, len));
+            batch.enter(TapState::RunTestIdle);
+            let triples = triples_for_batch(TapState::TestLogicReset, &batch);
+            assert_triples_eq(&triples, literal.0, literal.1, literal.2);
+        }
+    }
+
+    #[test]
+    fn register_write_with_idle_matches_golden() {
+        let bytes = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let params = one_tap_params();
+        let mut batch = JtagBatch::new();
+        batch.enter(TapState::ShiftIr);
+        batch.exchange_no_capture(build_ir_exchange(params, 0b10110, 5));
+        batch.enter(TapState::ShiftDr);
+        batch.exchange_no_capture(build_dr_exchange(params, &bytes, 41));
+        batch.enter(TapState::RunTestIdle);
+        batch.clock(8);
+        let triples = triples_for_batch(TapState::TestLogicReset, &batch);
+        assert_triples_eq(
+            &triples,
+            REGISTER_WRITE_EIGHT_IDLE.0,
+            REGISTER_WRITE_EIGHT_IDLE.1,
+            REGISTER_WRITE_EIGHT_IDLE.2,
+        );
     }
 }

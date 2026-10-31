@@ -93,6 +93,7 @@ fn add_generic_targets(vec: &mut Vec<ChipFamily>) {
                 name: "riscv".to_owned(),
                 part: None,
                 svd: None,
+                memory_ports: vec![],
                 documentation: HashMap::new(),
                 package_variants: vec![],
                 cores: vec![Core {
@@ -109,6 +110,7 @@ fn add_generic_targets(vec: &mut Vec<ChipFamily>) {
                 rtt_scan_ranges: None,
                 jtag: None,
                 default_binary_format: None,
+                skip_reset_on_ram_boot: false,
             }],
             flash_algorithms: vec![],
             source: TargetDescriptionSource::Generic,
@@ -134,11 +136,13 @@ fn add_generic_targets(vec: &mut Vec<ChipFamily>) {
                         mem_ap: None,
                     }),
                 }],
+                memory_ports: vec![],
                 memory_map: vec![],
                 flash_algorithms: vec![],
                 rtt_scan_ranges: None,
                 jtag: None,
                 default_binary_format: None,
+                skip_reset_on_ram_boot: false,
             }],
             flash_algorithms: vec![],
             source: TargetDescriptionSource::Generic,
@@ -462,6 +466,88 @@ mod tests {
 
     #[cfg(feature = "builtin-targets")]
     #[test]
+    fn v4x7_targets_and_flash_geometry() {
+        let registry = Registry::from_builtin_families();
+        for part in [
+            "CH32V407RET6",
+            "CH32V407VET6",
+            "CH32V407WEU6",
+            "CH32V467RET6",
+            "CH32V467VET6",
+            "CH32V467WEU6",
+        ] {
+            for (suffix, ram_size) in [("", 200 * 1024), ("_c576_r136", 136 * 1024)] {
+                let target = registry
+                    .get_target_by_name(format!("{part}{suffix}"))
+                    .unwrap();
+                let ram = target
+                    .memory_map
+                    .iter()
+                    .find_map(|r| r.as_ram_region())
+                    .unwrap();
+                assert_eq!(ram.range, 0x2000_0000..0x2000_0000 + ram_size);
+                assert_eq!(target.flash_algorithms.len(), 4);
+                for algo in &target.flash_algorithms {
+                    let props = &algo.flash_properties;
+                    if algo.name.ends_with("usr") || algo.name.ends_with("usr-legacy") {
+                        assert_eq!(
+                            props.address_range.end - props.address_range.start,
+                            992 * 1024
+                        );
+                        assert_eq!(props.page_size, 256);
+                        assert_eq!(props.sectors[0].size, 4096);
+                    } else {
+                        assert!(algo.pc_erase_all.is_none());
+                    }
+                }
+                let vendor = target
+                    .memory_map
+                    .iter()
+                    .filter_map(|r| r.as_nvm_region())
+                    .find(|r| r.name.as_deref() == Some("VND"))
+                    .unwrap();
+                assert!(!vendor.is_writable());
+            }
+        }
+    }
+
+    #[cfg(feature = "builtin-targets")]
+    #[test]
+    fn v4x7_detection_and_ram_split() {
+        let registry = Registry::from_builtin_families();
+        let family = registry
+            .families
+            .iter()
+            .find(|f| f.name == "CH32V4X7 Series")
+            .unwrap();
+        let detection = family.chip_detection[0].as_wch_link().unwrap();
+        for (id, part) in [
+            (0x4670_0000, "CH32V407VET6"),
+            (0x4671_0001, "CH32V407WEU6"),
+            (0x4672_0002, "CH32V407RET6"),
+            (0x4673_0000, "CH32V467VET6"),
+            (0x4674_0001, "CH32V467WEU6"),
+            (0x4675_0002, "CH32V467RET6"),
+        ] {
+            for revision in 0..16 {
+                assert_eq!(
+                    detection.variants[&((id | (revision << 4)) & detection.mask)],
+                    part
+                );
+            }
+            let split = &detection.ob_code_ram_splits[&id];
+            assert_eq!(split.address, 0x1fff_f802);
+            assert_eq!(split.mask, 0x40);
+            assert_eq!(split.variants[&(0xbf & split.mask)], part);
+            assert_eq!(
+                split.variants[&(0xff & split.mask)],
+                format!("{part}_c576_r136")
+            );
+        }
+    }
+
+    #[cfg(feature = "builtin-targets")]
+    #[test]
     fn try_fetch_not_unique() {
         let registry = Registry::from_builtin_families();
         // ambiguous: partially matches STM32G081KBUx and STM32G081KBUxN
@@ -493,7 +579,8 @@ mod tests {
     fn try_fetch3() {
         let registry = Registry::from_builtin_families();
         // ok: unique substring match
-        assert!(registry.get_target_by_name("STM32G081RBI").is_ok());
+        let target = registry.get_target_by_name("STM32G081RBI").unwrap();
+        assert_eq!(target.name, "STM32G081RBIx");
     }
 
     #[cfg(feature = "builtin-targets")]
@@ -501,7 +588,8 @@ mod tests {
     fn try_fetch4() {
         let registry = Registry::from_builtin_families();
         // ok: unique exact match
-        assert!(registry.get_target_by_name("nrf51822_Xxaa").is_ok());
+        let target = registry.get_target_by_name("nrf51822_Xxaa").unwrap();
+        assert_eq!(target.name, "nRF51822_xxAA");
     }
 
     #[test]
@@ -544,8 +632,8 @@ mod tests {
                         )
                         .unwrap_or_else(|error| {
                             panic!(
-                                "Failed to initialize flash algorithm ({}, {}, {core}): {}",
-                                &target.name, &raw_flash_algo.name, error
+                                "Failed to initialize flash algorithm ({}, {}, {core}): {error}",
+                                target.name, raw_flash_algo.name
                             )
                         });
                     }

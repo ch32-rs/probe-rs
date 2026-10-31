@@ -55,6 +55,9 @@ use super::registers::{
     FT10,
     FT11,
     GP,
+    MCAUSE,
+    MEPC,
+    MSTATUS,
     // Integer registers
     PC,
     RA,
@@ -147,6 +150,9 @@ static RISCV64_COMMON_REGS_SET: &[CoreRegister] = &[
     registers::as_64bit(T5),
     registers::as_64bit(T6),
     PC64,
+    registers::as_64bit(MEPC),
+    registers::as_64bit(MCAUSE),
+    registers::as_64bit(MSTATUS),
 ];
 
 static RISCV64_WITH_FP_REGS_SET: &[CoreRegister] = &[

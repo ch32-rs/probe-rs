@@ -6,9 +6,9 @@ use super::{FlashAlgorithm, FlashBuilder, FlashError, FlashPage, FlashProgress};
 use crate::config::NvmRegion;
 use crate::error::Error;
 use crate::flashing::encoder::FlashEncoder;
-use crate::flashing::{FlashLayout, FlashSector};
+use crate::flashing::{FlashLayout, FlashSector, FlashVerify, VerifyOutcome};
 use crate::memory::MemoryInterface;
-use crate::rtt::{Rtt, ScanRegion};
+use crate::rtt::{Rtt, RttTarget, ScanRegion};
 use crate::{Core, InstructionSet, RegisterValue, core::CoreRegisters, session::Session};
 use crate::{CoreStatus, Target};
 use std::borrow::Cow;
@@ -93,6 +93,27 @@ impl FlashData {
         }
     }
 
+    /// Returns the number of bytes that will be transferred during programming.
+    ///
+    /// For RAM-based data this delegates to the encoder so compression (e.g. `Miniz`)
+    /// is accounted for.  For raw host-side data (`Raw` variant with `Raw` encoding)
+    /// this sums the page sizes directly, which is both correct and avoids constructing
+    /// a redundant encoder.
+    pub fn program_size_estimate(&mut self, encoding: TransferEncoding, ignore_fills: bool) -> u64 {
+        self.encoder(encoding, ignore_fills).program_size()
+    }
+
+    /// Returns the fill size for progress bar setup.
+    ///
+    /// For data that has not yet been encoded (`Raw`) the fills are reported from
+    /// the layout.  This is used by the RAM-based flasher to set up the Fill
+    /// progress bar.  Host-side callers pass `TransferEncoding::Raw` / `false`
+    /// and obtain the same layout-based value; the host-side flasher then ignores
+    /// it (fill operations are implicit in page programming, not separate steps).
+    pub fn fill_size(&self) -> u64 {
+        self.layout().fills().iter().map(|f| f.size()).sum::<u64>()
+    }
+
     /// Returns the encoded data.
     pub fn encoder(&mut self, encoding: TransferEncoding, ignore_fills: bool) -> &FlashEncoder {
         if let FlashData::Loaded {
@@ -170,6 +191,12 @@ impl Flasher {
             regions: Vec::new(),
             read_flasher_rtt: false,
         })
+    }
+
+    /// Builder method to enable RTT.
+    pub fn with_rtt(mut self) -> Self {
+        self.read_rtt_output(true);
+        self
     }
 
     fn ensure_loaded(&mut self, session: &mut Session) -> Result<(), FlashError> {
@@ -496,6 +523,51 @@ impl Flasher {
         result
     }
 
+    /// Check every loaded region with the target's own signature facility.
+    ///
+    /// Returns `None` when any part of the image cannot be checked this way, so the caller
+    /// falls back to reading the contents back. Falling back is deliberate: a range that
+    /// cannot be signed has not been verified, and must not be reported as if it had.
+    fn verify_with_sequence(
+        &mut self,
+        session: &mut Session,
+        progress: &mut FlashProgress<'_>,
+        sequence: &dyn FlashVerify,
+        ignore_filled: bool,
+    ) -> Result<Option<bool>, FlashError> {
+        let encoding = self.flash_algorithm.transfer_encoding;
+        let core_index = self.core_index;
+        let mut core = session.core(core_index).map_err(FlashError::Core)?;
+
+        for region in self.regions.iter_mut() {
+            let flash_encoder = region.data.encoder(encoding, ignore_filled);
+            for page in flash_encoder.pages() {
+                let started = Instant::now();
+                let outcome = sequence
+                    .verify_range(&mut core, &region.region, page.address(), page.data())
+                    .map_err(FlashError::Core)?;
+                match outcome {
+                    VerifyOutcome::Match => {
+                        progress.page_verified(page.size() as u64, started.elapsed())
+                    }
+                    VerifyOutcome::Mismatch => {
+                        tracing::debug!("Signature mismatch for page at {:#010x}", page.address());
+                        return Ok(Some(false));
+                    }
+                    VerifyOutcome::Unsupported => {
+                        tracing::debug!(
+                            "Target cannot sign the page at {:#010x}; reading the image back instead",
+                            page.address()
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        Ok(Some(true))
+    }
+
     fn do_verify(
         &mut self,
         session: &mut Session,
@@ -503,6 +575,16 @@ impl Flasher {
         ignore_filled: bool,
     ) -> Result<bool, FlashError> {
         let encoding = self.flash_algorithm.transfer_encoding;
+
+        // A flash controller that can sign a range of flash lets us check the image without
+        // reading it back, which is otherwise the slowest part of a download.
+        if let Some(sequence) = session.target().debug_sequence.flash_verify_sequence()
+            && let Some(result) =
+                self.verify_with_sequence(session, progress, sequence.as_ref(), ignore_filled)?
+        {
+            return Ok(result);
+        }
+
         if let Some(verify) = self.flash_algorithm.pc_verify {
             // Try to use the verify function if available.
             self.run_verify(session, progress, |active, data| {
@@ -977,11 +1059,17 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
                 self.core.return_address(),
                 // For ARM Cortex-M cores, we have to add 1 to the return address,
                 // to ensure that we stay in Thumb mode.
-                if self.instruction_set == InstructionSet::Thumb2 {
-                    Some(algo.load_address + 1)
-                } else {
-                    Some(algo.load_address)
-                },
+                // For RISC-V cores, add 4 to the return address so that we point to the
+                // 2nd EBREAK instruction in RISCV_FLASH_BLOB_HEADER, otherwise the riscv
+                // check_for_semihosting fn will walk off the beginning of the algo
+                Some(match self.instruction_set {
+                    InstructionSet::Thumb2 => algo.load_address + 1,
+                    InstructionSet::RV32
+                    | InstructionSet::RV32C
+                    | InstructionSet::RV64
+                    | InstructionSet::RV64C => algo.load_address + 4,
+                    _ => algo.load_address,
+                }),
             ),
         ];
 
@@ -1022,8 +1110,10 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
             && self.rtt.is_none()
             && self.read_flasher_rtt
         {
+            let target = RttTarget::from(&self.core);
             match crate::rtt::try_attach_to_rtt(
                 &mut self.core,
+                &target,
                 Duration::from_secs(1),
                 &ScanRegion::Exact(rtt_address),
             ) {
@@ -1143,7 +1233,8 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
         Ok(())
     }
 
-    pub(super) fn read_flash(&mut self, address: u64, data: &mut [u8]) -> Result<(), FlashError> {
+    /// Do not use, only exposed with `pub` visibility for target-gen.
+    pub fn read_flash(&mut self, address: u64, data: &mut [u8]) -> Result<(), FlashError> {
         if let Some(read_flash) = self.flash_algorithm.pc_read {
             let page_size = self.flash_algorithm.flash_properties.page_size;
             let buffer_address = self.flash_algorithm.page_buffers[0];

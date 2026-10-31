@@ -34,6 +34,9 @@ pub mod sequences;
 
 pub use dtm::jtag_dtm::JtagDtmBuilder;
 
+/// Time to wait for the core to re-halt after a single instruction step.
+const SINGLE_STEP_TIMEOUT: Duration = Duration::from_millis(100);
+
 // ── Trigger-type helpers (RV64 bit layout) ───────────────────────────────────
 
 /// Unpack a 64-bit `tdata1` register value into `(trigger_type, Mcontrol)`.
@@ -319,6 +322,8 @@ impl<'state, X: XlenMode> RiscvCore<'state, X> {
     ) -> Result<Self, RiscvError> {
         X::configure_interface(&mut interface);
 
+        interface.ensure_debug_on_sw_breakpoint()?;
+
         if !state.misa_read {
             // Determine FPU presence from MISA extensions (F, D, or Q)
             let misa_val = interface
@@ -517,6 +522,11 @@ impl<X: XlenMode> CoreInterface for RiscvCore<'_, X> {
             Ok(CoreStatus::Halted(reason))
         } else if status.allrunning() {
             Ok(CoreStatus::Running)
+        } else if status.allunavail() {
+            // A hart can be temporarily unavailable while its clock or reset
+            // state changes. Report an unknown state and let the caller poll
+            // again instead of treating this as a mixed running/halted state.
+            Ok(CoreStatus::Unknown)
         } else {
             Err(Error::Other(
                 "Some cores are running while some are halted, this should not happen.".to_string(),
@@ -559,13 +569,19 @@ impl<X: XlenMode> CoreInterface for RiscvCore<'_, X> {
     }
 
     fn step(&mut self) -> Result<CoreInformation, Error> {
+        // `dcsr.cause` keeps the reason of the last entry into debug mode, and `status` clears
+        // this flag. Read it first to tell a fresh halt on a breakpoint from a dpc that a
+        // previous step already advanced past that breakpoint.
+        let stepped_over_breakpoint = self.state.pc_written;
         let halt_reason = self.status()?;
-        if matches!(
-            halt_reason,
-            CoreStatus::Halted(HaltReason::Breakpoint(
-                BreakpointCause::Software | BreakpointCause::Semihosting(_)
-            ))
-        ) {
+        if !stepped_over_breakpoint
+            && matches!(
+                halt_reason,
+                CoreStatus::Halted(HaltReason::Breakpoint(
+                    BreakpointCause::Software | BreakpointCause::Semihosting(_)
+                ))
+            )
+        {
             // If we are halted on a software breakpoint, we can skip the
             // single step and manually advance the dpc.
             let mut debug_pc = self.read_core_reg(RegisterId(0x7b1))?;
@@ -584,6 +600,7 @@ impl<X: XlenMode> CoreInterface for RiscvCore<'_, X> {
                 debug_pc.increment_address(4)?;
             }
             self.write_core_reg(RegisterId(0x7b1), debug_pc)?;
+            self.state.semihosting_command = None;
             return Ok(CoreInformation {
                 pc: debug_pc.try_into()?,
             });
@@ -605,11 +622,18 @@ impl<X: XlenMode> CoreInterface for RiscvCore<'_, X> {
 
         // Now we can resume the core for the single step.
         self.resume_core()?;
-        self.wait_for_core_halted(Duration::from_millis(100))?;
+        let step_result = self.wait_for_core_halted(SINGLE_STEP_TIMEOUT);
 
-        let pc = self.read_core_reg(RegisterId(0x7b1))?;
+        // On timeout, force a halt so the restore below can run; otherwise
+        // `dcsr.step` stays set and hardware breakpoints stay disabled.
+        if step_result.is_err() {
+            tracing::warn!("Single step did not halt within {SINGLE_STEP_TIMEOUT:?}; forcing halt");
+            if let Err(e) = self.interface.halt(Duration::from_millis(100)) {
+                tracing::warn!("Could not force halt after failed single step: {:?}", e);
+            }
+        }
 
-        // clear step request
+        // Restore step configuration unconditionally, even after a failed step.
         let mut dcsr = Dcsr(self.interface.read_csr(0x7b0)? as u32);
         dcsr.set_step(false);
         //Re-enable interrupts for single step.
@@ -625,6 +649,10 @@ impl<X: XlenMode> CoreInterface for RiscvCore<'_, X> {
             // If we are halted on a hardware breakpoint.
             self.enable_breakpoints(true)?;
         }
+
+        step_result?;
+
+        let pc = self.read_core_reg(RegisterId(0x7b1))?;
 
         self.on_halted()?;
         self.state.pc_written = false;
@@ -854,6 +882,10 @@ impl<X: XlenMode> CoreInterface for RiscvCore<'_, X> {
         X::core_type()
     }
 
+    fn is_64_bit(&self) -> bool {
+        matches!(X::core_type(), CoreType::Riscv64)
+    }
+
     fn instruction_set(&mut self) -> Result<InstructionSet, Error> {
         // Check if the Bit at position 2 (signifies letter C, for compressed) is set.
         let misa_val = self.interface.read_csr(0x301)?;
@@ -941,7 +973,7 @@ impl RiscvCoreState {
 
 memory_mapped_bitfield_register! {
     /// `dmcontrol` register, located at address 0x10
-    pub struct Dmcontrol(u32);
+    pub struct Dmcontrol(pub u32);
     0x10, "dmcontrol",
     impl From;
 
@@ -1016,7 +1048,7 @@ memory_mapped_bitfield_register! {
     /// Readonly `dmstatus` register.
     ///
     /// Located at address 0x11
-    pub struct Dmstatus(u32);
+    pub struct Dmstatus(pub u32);
     0x11, "dmstatus",
     impl From;
 
@@ -1099,7 +1131,7 @@ memory_mapped_bitfield_register! {
 }
 
 bitfield! {
-    struct Dcsr(u32);
+    struct Dcsr(pub u32);
     impl Debug;
 
     /// Debug module version. Value 4 indicates spec 1.0; value 3 indicates 0.13.
@@ -1126,7 +1158,7 @@ bitfield! {
 
 memory_mapped_bitfield_register! {
     /// Abstract Control and Status (see 3.12.6)
-    pub struct Abstractcs(u32);
+    pub struct Abstractcs(pub u32);
     0x16, "abstractcs",
     impl From;
 
@@ -1142,7 +1174,7 @@ memory_mapped_bitfield_register! {
 
 memory_mapped_bitfield_register! {
     /// Hart Info (see 3.12.3)
-    pub struct Hartinfo(u32);
+    pub struct Hartinfo(pub u32);
     0x12, "hartinfo",
     impl From;
 
@@ -1152,41 +1184,41 @@ memory_mapped_bitfield_register! {
     dataaddr, _: 11, 0;
 }
 
-memory_mapped_bitfield_register! { pub struct Data0(u32); 0x04, "data0", impl From; }
-memory_mapped_bitfield_register! { pub struct Data1(u32); 0x05, "data1", impl From; }
-memory_mapped_bitfield_register! { pub struct Data2(u32); 0x06, "data2", impl From; }
-memory_mapped_bitfield_register! { pub struct Data3(u32); 0x07, "data3", impl From; }
-memory_mapped_bitfield_register! { pub struct Data4(u32); 0x08, "data4", impl From; }
-memory_mapped_bitfield_register! { pub struct Data5(u32); 0x09, "data5", impl From; }
-memory_mapped_bitfield_register! { pub struct Data6(u32); 0x0A, "data6", impl From; }
-memory_mapped_bitfield_register! { pub struct Data7(u32); 0x0B, "data7", impl From; }
-memory_mapped_bitfield_register! { pub struct Data8(u32); 0x0C, "data8", impl From; }
-memory_mapped_bitfield_register! { pub struct Data9(u32); 0x0D, "data9", impl From; }
-memory_mapped_bitfield_register! { pub struct Data10(u32); 0x0E, "data10", impl From; }
-memory_mapped_bitfield_register! { pub struct Data11(u32); 0x0f, "data11", impl From; }
+memory_mapped_bitfield_register! { pub struct Data0(pub u32); 0x04, "data0", impl From; }
+memory_mapped_bitfield_register! { pub struct Data1(pub u32); 0x05, "data1", impl From; }
+memory_mapped_bitfield_register! { pub struct Data2(pub u32); 0x06, "data2", impl From; }
+memory_mapped_bitfield_register! { pub struct Data3(pub u32); 0x07, "data3", impl From; }
+memory_mapped_bitfield_register! { pub struct Data4(pub u32); 0x08, "data4", impl From; }
+memory_mapped_bitfield_register! { pub struct Data5(pub u32); 0x09, "data5", impl From; }
+memory_mapped_bitfield_register! { pub struct Data6(pub u32); 0x0A, "data6", impl From; }
+memory_mapped_bitfield_register! { pub struct Data7(pub u32); 0x0B, "data7", impl From; }
+memory_mapped_bitfield_register! { pub struct Data8(pub u32); 0x0C, "data8", impl From; }
+memory_mapped_bitfield_register! { pub struct Data9(pub u32); 0x0D, "data9", impl From; }
+memory_mapped_bitfield_register! { pub struct Data10(pub u32); 0x0E, "data10", impl From; }
+memory_mapped_bitfield_register! { pub struct Data11(pub u32); 0x0f, "data11", impl From; }
 
-memory_mapped_bitfield_register! { struct Command(u32); 0x17, "command", impl From; }
+memory_mapped_bitfield_register! { struct Command(pub u32); 0x17, "command", impl From; }
 
-memory_mapped_bitfield_register! { pub struct Progbuf0(u32); 0x20, "progbuf0", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf1(u32); 0x21, "progbuf1", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf2(u32); 0x22, "progbuf2", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf3(u32); 0x23, "progbuf3", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf4(u32); 0x24, "progbuf4", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf5(u32); 0x25, "progbuf5", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf6(u32); 0x26, "progbuf6", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf7(u32); 0x27, "progbuf7", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf8(u32); 0x28, "progbuf8", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf9(u32); 0x29, "progbuf9", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf10(u32); 0x2A, "progbuf10", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf11(u32); 0x2B, "progbuf11", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf12(u32); 0x2C, "progbuf12", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf13(u32); 0x2D, "progbuf13", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf14(u32); 0x2E, "progbuf14", impl From; }
-memory_mapped_bitfield_register! { pub struct Progbuf15(u32); 0x2F, "progbuf15", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf0(pub u32); 0x20, "progbuf0", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf1(pub u32); 0x21, "progbuf1", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf2(pub u32); 0x22, "progbuf2", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf3(pub u32); 0x23, "progbuf3", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf4(pub u32); 0x24, "progbuf4", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf5(pub u32); 0x25, "progbuf5", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf6(pub u32); 0x26, "progbuf6", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf7(pub u32); 0x27, "progbuf7", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf8(pub u32); 0x28, "progbuf8", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf9(pub u32); 0x29, "progbuf9", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf10(pub u32); 0x2A, "progbuf10", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf11(pub u32); 0x2B, "progbuf11", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf12(pub u32); 0x2C, "progbuf12", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf13(pub u32); 0x2D, "progbuf13", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf14(pub u32); 0x2E, "progbuf14", impl From; }
+memory_mapped_bitfield_register! { pub struct Progbuf15(pub u32); 0x2F, "progbuf15", impl From; }
 
 bitfield! {
     /// Trigger type 2 — legacy address/data match control (mcontrol).
-    struct Mcontrol(u32);
+    struct Mcontrol(pub u32);
     impl Debug;
 
     type_, set_type: 31, 28;
@@ -1213,7 +1245,7 @@ bitfield! {
     /// Low bits 0–15 are position-compatible with `Mcontrol`. Differences start
     /// at bit 16: a unified 4-bit `size` field replaces the split `sizelo`/`sizehi`
     /// of the legacy type, and new `hit0`, `vu`, `vs`, and `hit1` bits are added.
-    struct Mcontrol6(u32);
+    struct Mcontrol6(pub u32);
     impl Debug;
 
     type_, set_type: 31, 28;
@@ -1244,7 +1276,7 @@ bitfield! {
 
 memory_mapped_bitfield_register! {
     /// Isa and Extensions (see RISC-V Privileged Spec, 3.1.1)
-    pub struct Misa(u32);
+    pub struct Misa(pub u32);
     0x301, "misa",
     impl From;
 

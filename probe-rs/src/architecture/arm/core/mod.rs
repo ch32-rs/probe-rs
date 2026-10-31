@@ -44,7 +44,7 @@ impl Dump {
 }
 
 memory_mapped_bitfield_register! {
-    pub struct Dfsr(u32);
+    pub struct Dfsr(pub u32);
     0xE000_ED30, "DFSR",
     /// Indicates an asynchronous debug event generated because of **EDBGRQ** being asserted:
     /// * `false`: no **EDBGRQ** debug event.
@@ -150,6 +150,10 @@ pub struct CortexMState {
     /// `pending_step` tracks whether we're waiting for a step so that `CoreInterface::status()`
     /// can return `HaltReason::Step` instead of `HaltReason::Request` if a step was pending.
     pending_step: bool,
+
+    /// Whether the PC was written since we last halted. Used to avoid stepping over a
+    /// breakpoint the core is no longer sitting on.
+    pc_written: bool,
 }
 
 impl CortexMState {
@@ -161,6 +165,7 @@ impl CortexMState {
             fp_present: false,
             semihosting_command: None,
             pending_step: false,
+            pc_written: false,
         }
     }
 
@@ -215,6 +220,10 @@ pub struct CortexARState {
 
     // Cached semihosting command (for A/R-profile semihosting)
     pub(crate) semihosting_command: Option<SemihostingCommand>,
+
+    // Enabled vector catches that use the Undefined Instruction vector catch
+    pub(crate) catch_hardfault: bool,
+    pub(crate) catch_hlt: bool,
 }
 
 impl CortexARState {
@@ -226,6 +235,8 @@ impl CortexARState {
             register_cache: vec![],
             fp_reg_count: 0,
             semihosting_command: None,
+            catch_hardfault: false,
+            catch_hlt: false,
         }
     }
 

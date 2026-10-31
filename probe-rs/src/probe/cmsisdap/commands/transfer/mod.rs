@@ -1,4 +1,5 @@
 pub mod configure;
+pub mod write_abort;
 
 use std::iter;
 
@@ -62,6 +63,14 @@ fn creating_inner_transfer_request() {
 }
 
 impl InnerTransferRequest {
+    /// Bytes this transfer adds to the command, and to its reply.
+    fn lengths(&self) -> (usize, usize) {
+        let request = 1 + if self.data.is_some() { 4 } else { 0 };
+        let response =
+            4 * usize::from(self.td_timestamp_request) + 4 * usize::from(self.RnW == RW::R);
+        (request, response)
+    }
+
     fn to_bytes(&self, buffer: &mut [u8]) -> Result<usize, SendError> {
         buffer[0] = (self.APnDP as u8)
             | ((self.RnW as u8) << 1)
@@ -122,6 +131,20 @@ impl InnerTransferResponse {
     }
 }
 
+/// Bytes of a `DAP_Transfer` command, and of its reply, that are not transfers.
+///
+/// The command carries its id, the DAP index and the transfer count; the reply answers with the
+/// command id, the transfer count and the last transfer's acknowledgement.
+const HEADER_LEN: usize = 3;
+
+/// A point in a [`TransferRequest`] to come back to.
+#[derive(Debug, Clone, Copy)]
+pub struct TransferMark {
+    transfers: usize,
+    request_len: usize,
+    response_len: usize,
+}
+
 /// Read/write single and multiple registers.
 ///
 /// The DAP_Transfer Command reads or writes data to CoreSight registers.
@@ -140,6 +163,8 @@ pub struct TransferRequest {
     /// Zero based device index of the selected JTAG device. For SWD mode the value is ignored.
     pub dap_index: u8,
     transfers: Vec<InnerTransferRequest>,
+    request_len: usize,
+    response_len: usize,
 }
 
 impl TransferRequest {
@@ -147,7 +172,62 @@ impl TransferRequest {
         Self {
             dap_index: 0,
             transfers: vec![],
+            request_len: HEADER_LEN,
+            response_len: HEADER_LEN,
         }
+    }
+
+    /// How much of a request has been built, so that it can be put back.
+    pub fn mark(&self) -> TransferMark {
+        TransferMark {
+            transfers: self.transfers.len(),
+            request_len: self.request_len,
+            response_len: self.response_len,
+        }
+    }
+
+    /// Drop everything added since `mark`.
+    pub fn rewind(&mut self, mark: TransferMark) {
+        debug_assert!(
+            mark.transfers <= self.transfers.len(),
+            "a mark from another request"
+        );
+        self.transfers.truncate(mark.transfers);
+        self.request_len = mark.request_len;
+        self.response_len = mark.response_len;
+    }
+
+    /// Bytes this command and its reply occupy in a packet.
+    pub fn packet_lengths(&self) -> (usize, usize) {
+        (self.request_len, self.response_len)
+    }
+
+    /// Transfers in this command.
+    pub fn len(&self) -> usize {
+        self.transfers.len()
+    }
+
+    /// True when a `packet_size` packet still has room for one more `rw` transfer.
+    ///
+    /// The transfer count travels in a single byte, so a command is capped at [`u8::MAX`]
+    /// transfers however large the packet is.
+    pub fn has_room_for(&self, rw: RW, packet_size: u16) -> bool {
+        if self.len() == u8::MAX as usize {
+            return false;
+        }
+
+        // Price the transfer with the encoder rather than restating what it writes. Only the
+        // direction changes the size, so the address here is arbitrary.
+        let (added_request, added_response) = InnerTransferRequest::new(
+            RegisterAddress::ApRegister(0),
+            rw,
+            (rw == RW::W).then_some(0),
+        )
+        .lengths();
+
+        let capacity = packet_size as usize;
+        let (request, response) = self.packet_lengths();
+        request + added_request <= capacity && response + added_response <= capacity
     }
 
     pub fn read<T: Into<RegisterAddress>>(address: T) -> Self {
@@ -163,13 +243,18 @@ impl TransferRequest {
     }
 
     pub fn add_read(&mut self, address: RegisterAddress) {
-        self.transfers
-            .push(InnerTransferRequest::new(address, RW::R, None));
+        self.push(InnerTransferRequest::new(address, RW::R, None));
     }
 
     pub fn add_write(&mut self, address: RegisterAddress, data: u32) {
-        self.transfers
-            .push(InnerTransferRequest::new(address, RW::W, Some(data)));
+        self.push(InnerTransferRequest::new(address, RW::W, Some(data)));
+    }
+
+    fn push(&mut self, transfer: InnerTransferRequest) {
+        let (request, response) = transfer.lengths();
+        self.request_len += request;
+        self.response_len += response;
+        self.transfers.push(transfer);
     }
 }
 
@@ -264,20 +349,22 @@ pub struct TransferResponse {
     pub transfers: Vec<InnerTransferResponse>,
 }
 
+/// Repeats one access, so that one packet carries more words than
+/// [`TransferRequest`] can.
 #[derive(Debug)]
-pub(crate) struct TransferBlockRequest {
+pub struct TransferBlockRequest {
     /// Zero-based device index of the selected JTAG device. For SWD mode the
     /// value is ignored.
-    pub(crate) dap_index: u8,
+    pub dap_index: u8,
 
     /// Number of transfers
-    pub(crate) transfer_count: u16,
+    pub transfer_count: u16,
 
     /// Information about requested access
-    pub(crate) transfer_request: InnerTransferBlockRequest,
+    pub transfer_request: InnerTransferBlockRequest,
 
     /// Register values to write for writes
-    pub(crate) transfer_data: Vec<u32>,
+    pub transfer_data: Vec<u32>,
 }
 
 impl Request for TransferBlockRequest {
@@ -320,16 +407,8 @@ impl Request for TransferBlockRequest {
 
         let mut data = Vec::with_capacity(transfer_count as usize);
 
-        let num_transfers = (buffer.len() - 3) / 4;
-
-        tracing::debug!(
-            "Expected {} responses, got {} responses with data..",
-            transfer_count,
-            num_transfers
-        );
-
-        // if it's a read, process the read data.
-        // If it's a write, there's no interesting data in the response.
+        // A read holds one word for every transfer that ran. A write holds no
+        // data.
         if self.transfer_request.r_n_w == RW::R {
             for data_offset in 0..transfer_count as usize {
                 data.push(
@@ -369,7 +448,7 @@ impl Request for TransferBlockRequest {
 }
 
 impl TransferBlockRequest {
-    pub(crate) fn write_request(address: RegisterAddress, data: Vec<u32>) -> Self {
+    pub fn write_request(address: RegisterAddress, data: Vec<u32>) -> Self {
         let inner = InnerTransferBlockRequest {
             ap_n_dp: address.is_ap(),
             r_n_w: RW::W,
@@ -385,7 +464,7 @@ impl TransferBlockRequest {
         }
     }
 
-    pub(crate) fn read_request(address: RegisterAddress, read_count: u16) -> Self {
+    pub fn read_request(address: RegisterAddress, read_count: u16) -> Self {
         let inner = InnerTransferBlockRequest {
             ap_n_dp: address.is_ap(),
             r_n_w: RW::R,
@@ -402,8 +481,9 @@ impl TransferBlockRequest {
     }
 }
 
+/// The access that a [`TransferBlockRequest`] repeats.
 #[derive(Debug, Copy, Clone)]
-pub(crate) struct InnerTransferBlockRequest {
+pub struct InnerTransferBlockRequest {
     ap_n_dp: bool,
     r_n_w: RW,
     a2: bool,
@@ -420,9 +500,99 @@ impl InnerTransferBlockRequest {
     }
 }
 
+/// The response to a [`TransferBlockRequest`].
 #[derive(Debug)]
-pub(crate) struct TransferBlockResponse {
+pub struct TransferBlockResponse {
     pub transfer_count: u16,
     pub transfer_response: LastTransferResponse,
     pub transfer_data: Vec<u32>,
+}
+
+/// `DAP_TransferAbort`, which ends a transfer the probe is still working through.
+///
+/// The probe sends no reply to this, so it is the one command that can be issued while the device
+/// still owes a response to something else.
+#[derive(Clone, Copy, Debug)]
+pub struct TransferAbortRequest;
+
+impl Request for TransferAbortRequest {
+    const COMMAND_ID: CommandId = CommandId::TransferAbort;
+
+    type Response = ();
+
+    fn to_bytes(&self, _buffer: &mut [u8]) -> Result<usize, SendError> {
+        Ok(0)
+    }
+
+    fn parse_response(&self, _buffer: &[u8]) -> Result<Self::Response, SendError> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod packet_length_tests {
+    use super::*;
+
+    fn read_and_write() -> TransferRequest {
+        let mut request = TransferRequest::empty();
+        request.add_read(RegisterAddress::ApRegister(0x0C));
+        request.add_write(RegisterAddress::ApRegister(0x04), 0x1234_5678);
+        request
+    }
+
+    #[test]
+    fn the_command_length_is_what_the_encoder_writes() {
+        let request = read_and_write();
+
+        let mut buffer = [0u8; 64];
+        let written = request.to_bytes(&mut buffer).unwrap();
+
+        // `to_bytes` writes everything in the packet but the command id.
+        assert_eq!(request.packet_lengths().0, written + 1);
+    }
+
+    #[test]
+    fn the_reply_length_is_what_the_parser_consumes() {
+        let request = read_and_write();
+        let reply_len = request.packet_lengths().1 - 1;
+
+        // Both transfers ran, and the last was acknowledged. Only the read carries data back.
+        let mut reply = vec![0u8; reply_len];
+        reply[0] = 2;
+        reply[1] = Ack::Ok as u8;
+        assert!(request.parse_response(&reply).is_ok());
+
+        assert!(matches!(
+            request.parse_response(&reply[..reply_len - 1]),
+            Err(SendError::NotEnoughData)
+        ));
+    }
+
+    #[test]
+    fn a_packet_takes_more_reads_than_writes() {
+        let mut reads = TransferRequest::empty();
+        while reads.has_room_for(RW::R, 64) {
+            reads.add_read(RegisterAddress::ApRegister(0x0C));
+        }
+
+        let mut writes = TransferRequest::empty();
+        while writes.has_room_for(RW::W, 64) {
+            writes.add_write(RegisterAddress::ApRegister(0x0C), 0);
+        }
+
+        assert_eq!(reads.len(), 15);
+        assert_eq!(writes.len(), 12);
+        assert!(reads.packet_lengths().1 <= 64);
+        assert!(writes.packet_lengths().0 <= 64);
+    }
+
+    #[test]
+    fn no_packet_takes_more_transfers_than_the_count_field() {
+        let mut request = TransferRequest::empty();
+        while request.has_room_for(RW::R, u16::MAX) {
+            request.add_read(RegisterAddress::ApRegister(0x0C));
+        }
+
+        assert_eq!(request.len(), u8::MAX as usize);
+    }
 }

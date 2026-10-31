@@ -7,7 +7,10 @@ use crate::{
             dp::DpAddress,
         },
         riscv::{Riscv64, RiscvCoreState, communication_interface::RiscvCommunicationInterface},
-        xtensa::{XtensaCoreState, communication_interface::XtensaCommunicationInterface},
+        xtensa::{
+            XtensaCoreState,
+            communication_interface::{XtensaCommunicationInterface, XtensaDebugInterfaceState},
+        },
     },
 };
 
@@ -39,13 +42,27 @@ impl CombinedCoreState {
         self.core_state.is_arm()
     }
 
+    /// Creates the debug module state of an Xtensa core, with the properties that the target
+    /// description defines.
+    pub(crate) fn xtensa_interface_state(&self) -> Result<XtensaDebugInterfaceState, Error> {
+        let ResolvedCoreOptions::Xtensa { options, .. } = &self.core_state.core_access_options
+        else {
+            unreachable!(
+                "The stored core state is not compatible with the Xtensa architecture. \
+                This should never happen. Please file a bug if it does."
+            );
+        };
+
+        Ok(XtensaDebugInterfaceState::new(
+            (&options.core_properties).try_into()?,
+        ))
+    }
+
     pub(crate) fn attach_arm<'probe>(
         &'probe mut self,
-        target: &'probe Target,
+        target: &'probe mut Target,
         arm_interface: &'probe mut Box<dyn ArmDebugInterface>,
     ) -> Result<Core<'probe>, Error> {
-        let name = &target.cores[self.id].name;
-
         let ResolvedCoreOptions::Arm { options, sequence } = &self.core_state.core_access_options
         else {
             unreachable!(
@@ -58,8 +75,10 @@ impl CombinedCoreState {
             &mut **arm_interface,
             &self.arm_memory_ap(),
             self.specific_state.core_type(),
+            target,
         )?;
 
+        let name = &target.cores[self.id].name;
         let memory = arm_interface.memory_interface(&self.arm_memory_ap())?;
 
         Ok(match &mut self.specific_state {

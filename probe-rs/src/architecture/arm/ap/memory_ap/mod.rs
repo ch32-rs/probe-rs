@@ -52,6 +52,19 @@ macro_rules! attached_regs_to_mem_ap {
 // Re-export the macro so that it can be used in this crate.
 pub(crate) use attached_regs_to_mem_ap;
 
+/// What it takes to put a memory AP into a transfer size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataSizeSetup {
+    /// The AP is already in it.
+    Ready,
+    /// Write this word to CSW. It may travel in the same batch as the transfers it sets up, since
+    /// CSW shares a register bank with TAR and DRW.
+    Write(u32),
+    /// The AP needs a write and a read back before any transfer relies on the size, so the setup
+    /// cannot share a batch with them.
+    Separately,
+}
+
 /// Common trait for all memory access ports.
 pub trait MemoryApType:
     ApRegAccess<BASE> + ApRegAccess<BASE2> + ApRegAccess<TAR> + ApRegAccess<TAR2> + ApRegAccess<DRW>
@@ -71,6 +84,19 @@ pub trait MemoryApType:
 
     /// Returns whether the Memory AP only supports 32 bit data size.
     fn supports_only_32bit_data_size(&self) -> bool;
+
+    /// What it takes to put this AP into `data_size`.
+    ///
+    /// Returning the write rather than performing it lets it join the batch that carries the
+    /// transfers, which is a packet those transfers would otherwise wait for.
+    fn datasize_setup(&self, data_size: DataSize) -> Result<DataSizeSetup, ArmError>;
+
+    /// Record that the write [`Self::datasize_setup`] asked for reached the target.
+    ///
+    /// The AP caches CSW, so a write sent in a batch has to be reported back. A batch that failed
+    /// must not report one: read the register with [`Self::status`] instead, since whether the
+    /// write landed is not known.
+    fn note_datasize(&mut self, data_size: DataSize);
 
     /// Attempts to set the requested data size.
     ///
@@ -96,18 +122,18 @@ pub trait MemoryApType:
     /// The base address of this AP which is used to then access all relative control registers.
     fn base_address<I: ApAccess>(&self, interface: &mut I) -> Result<u64, ArmError> {
         let base_register: BASE = interface.read_ap_register(self)?;
-        if !base_register.present {
+        if !base_register.present() {
             return Err(ArmError::Other("debug entry not present".to_string()));
         }
 
-        let mut base_address = if BaseAddrFormat::ADIv5 == base_register.Format {
+        let mut base_address = if BaseAddrFormat::ADIv5 == base_register.Format() {
             let base2: BASE2 = interface.read_ap_register(self)?;
 
-            u64::from(base2.BASEADDR) << 32
+            u64::from(base2.BASEADDR()) << 32
         } else {
             0
         };
-        base_address |= u64::from(base_register.BASEADDR << 12);
+        base_address |= u64::from(base_register.BASEADDR() << 12);
 
         Ok(base_address)
     }
@@ -125,17 +151,15 @@ pub trait MemoryApType:
         let address_upper = (address >> 32) as u32;
 
         if self.has_large_address_extension() {
-            let tar = TAR2 {
-                address: address_upper,
-            };
+            let mut tar = TAR2::from_raw(0);
+            tar.set_address(address_upper);
             interface.write_ap_register(self, tar)?;
         } else if address_upper != 0 {
             return Err(ArmError::OutOfBounds);
         }
 
-        let tar = TAR {
-            address: address_lower,
-        };
+        let mut tar = TAR::from_raw(0);
+        tar.set_address(address_lower);
         interface.write_ap_register(self, tar)?;
 
         Ok(())
@@ -151,7 +175,7 @@ pub trait MemoryApType:
             // If transferring only 1 word, use non-repeated register access, because it might be
             // faster depending on the probe.
             [value] => interface.read_ap_register(self).map(|drw: DRW| {
-                *value = drw.data;
+                *value = drw.data();
             }),
             _ => interface.read_ap_register_repeated::<_, DRW>(self, values),
         }
@@ -168,7 +192,7 @@ pub trait MemoryApType:
         match values {
             // If transferring only 1 word, use non-repeated register access, because it might be
             // faster depending on the probe.
-            &[data] => interface.write_ap_register(self, DRW { data }),
+            &[data] => interface.write_ap_register(self, DRW::from_raw(data)),
             _ => interface.write_ap_register_repeated::<_, DRW>(self, values),
         }
         .map_err(AccessPortError::register_write_error::<DRW, _>)
@@ -184,7 +208,7 @@ macro_rules! memory_aps {
         ),*
     ) => {
         /// Sum type for all memory access ports.
-        #[derive(Debug)]
+        #[derive(Debug, Clone)]
         pub enum MemoryAp {
             $(
                 $(#[$outer])*
@@ -211,9 +235,10 @@ macro_rules! memory_aps {
                 let idr: IDR = idr_raw.try_into()?;
                 tracing::debug!("reading IDR: {:x?}", idr);
                 use crate::architecture::arm::ap::ApType;
-                Ok(match idr.TYPE {
+                Ok(match idr.TYPE() {
                     ApType::JtagComAp => return Err(ArmError::WrongApType),
                     $(ApType::$variant => <$type>::new(interface, address.clone())?.into(),)*
+                    ApType::Unknown(_) => return Err(ArmError::WrongApType),
                 })
             }
         }
@@ -272,6 +297,14 @@ impl MemoryApType for MemoryAp {
 
     fn supports_only_32bit_data_size(&self) -> bool {
         mem_ap_forward!(self, supports_only_32bit_data_size())
+    }
+
+    fn datasize_setup(&self, data_size: DataSize) -> Result<DataSizeSetup, ArmError> {
+        mem_ap_forward!(self, datasize_setup(data_size))
+    }
+
+    fn note_datasize(&mut self, data_size: DataSize) {
+        mem_ap_forward!(self, note_datasize(data_size))
     }
 
     fn try_set_datasize<I: ApAccess>(

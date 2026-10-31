@@ -26,7 +26,7 @@ use crate::{
     probe::DebugProbeError,
 };
 pub use communication_interface::{
-    ArmChipInfo, ArmCommunicationInterface, ArmDebugInterface, DapError, DapProbe, SwdSequence,
+    ArmChipInfo, ArmCommunicationInterface, ArmDebugInterface, DapError, SwdSequence,
 };
 pub use swo::{SwoAccess, SwoConfig, SwoMode, SwoReader};
 pub use traits::*;
@@ -60,6 +60,12 @@ pub enum ArmError {
 
     /// The current target device is not an ARM device.
     NoArmTarget,
+
+    /// No target responded to the debug port. Check that the target is connected and powered, and that the SWD/JTAG wiring is correct.
+    NoTargetResponse {
+        /// The underlying communication error from the failed debug port read.
+        source: Box<ArmError>,
+    },
 
     /// Error using access port {address:?}.
     AccessPort {

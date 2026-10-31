@@ -1,15 +1,17 @@
 //! CMSIS-DAP probe implementation.
+mod arm;
+mod cmsis_swd;
 mod commands;
+mod tcp;
 mod tools;
 
 use crate::{
     CoreStatus,
     architecture::{
         arm::{
-            ArmCommunicationInterface, ArmDebugInterface, ArmError, DapError, Pins, RawDapAccess,
-            RegisterAddress, SwoAccess, SwoConfig, SwoMode,
-            communication_interface::DapProbe,
-            dp::{Abort, Ctrl, DpRegister},
+            ArmCommunicationInterface, ArmDebugInterface, ArmError, DapError, SwoAccess, SwoConfig,
+            SwoMode,
+            dp::{Abort, Ctrl, DpRegister, DpRegisterAddress},
             sequences::ArmDebugSequence,
             swo::poll_interval_from_buf_size,
         },
@@ -22,12 +24,18 @@ use crate::{
         },
     },
     probe::{
-        AutoImplementJtagAccess, BatchCommand, DebugProbe, DebugProbeError, DebugProbeInfo,
-        DebugProbeSelector, JtagAccess, JtagDriverState, ProbeFactory, WireProtocol,
-        cmsisdap::commands::{
-            CmsisDapError, RequestError,
-            general::info::{CapabilitiesCommand, PacketCountCommand, SWOTraceBufferSizeCommand},
+        DebugProbe, DebugProbeError, DebugProbeSelector, JtagChain, JtagChainAccess,
+        JtagChainState, ProbeFactory, ResetLine, WireProtocol,
+        cmsisdap::{
+            arm::CmsisDapTransport,
+            commands::{
+                CmsisDapError, RequestError,
+                general::info::{
+                    CapabilitiesCommand, PacketCountCommand, SWOTraceBufferSizeCommand,
+                },
+            },
         },
+        swd::SwdProbe,
     },
 };
 
@@ -41,7 +49,6 @@ use commands::{
         reset::{ResetRequest, ResetResponse},
     },
     jtag::{
-        JtagBuffer,
         configure::ConfigureRequest as JtagConfigureRequest,
         sequence::{
             Sequence as JtagSequence, SequenceRequest as JtagSequenceRequest,
@@ -51,18 +58,15 @@ use commands::{
     swd,
     swj::{
         clock::SWJClockRequest,
-        pins::{SWJPinsRequest, SWJPinsRequestBuilder, SWJPinsResponse},
+        pins::{SWJPinsRequestBuilder, SWJPinsResponse},
         sequence::{SequenceRequest, SequenceResponse},
     },
     swo,
-    transfer::{
-        Ack, TransferBlockRequest, TransferBlockResponse, TransferRequest,
-        configure::ConfigureRequest,
-    },
+    transfer::{Ack, TransferRequest, configure::ConfigureRequest, write_abort::WriteAbortRequest},
 };
 use probe_rs_target::ScanChainElement;
 
-use std::{fmt::Write, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use bitvec::prelude::*;
 
@@ -80,14 +84,63 @@ impl std::fmt::Display for CmsisDapFactory {
 
 impl ProbeFactory for CmsisDapFactory {
     fn open(&self, selector: &DebugProbeSelector) -> Result<Box<dyn DebugProbe>, DebugProbeError> {
-        CmsisDap::new_from_device(tools::open_device_from_selector(selector)?)
+        let device = match tcp_address(selector) {
+            Some(address) => CmsisDapDevice::Tcp {
+                device: tcp::TcpDevice::connect(address).map_err(|error| {
+                    DebugProbeError::ProbeCouldNotBeCreated(CmsisDapError::TcpConnect(error).into())
+                })?,
+                // Large enough for the packet size query; the reply to it replaces this.
+                max_packet_size: 1024,
+                timeout: commands::DEFAULT_USB_TIMEOUT,
+            },
+            None => tools::open_device_from_selector(selector)?,
+        };
+        CmsisDap::new_from_device(device)
             .map(Box::new)
             .map(DebugProbe::into_probe)
     }
 
-    fn list_probes(&self) -> Vec<DebugProbeInfo> {
+    fn list_probes(&self) -> Vec<crate::probe::list::ProbeListItem> {
         tools::list_cmsisdap_devices()
     }
+
+    fn list_probes_filtered(
+        &self,
+        selector: Option<&DebugProbeSelector>,
+    ) -> Vec<crate::probe::list::ProbeListItem> {
+        // A TCP probe cannot be enumerated, so list it when the selector names one.
+        if let Some(selector) = selector
+            && let Some(address) = tcp_address(selector)
+        {
+            return vec![crate::probe::list::ProbeListItem::accessible(
+                crate::probe::DebugProbeInfo {
+                    identifier: "CMSIS-DAP TCP".to_string(),
+                    vendor_id: tcp::TCP_VID,
+                    product_id: tcp::TCP_PID,
+                    serial_number: Some(address.to_string()),
+                    probe_factory: &Self,
+                    is_hid_interface: false,
+                    interface: None,
+                    usb_location: None,
+                },
+            )];
+        }
+        self.list_probes()
+            .into_iter()
+            .filter(|probe| selector.is_none_or(|s| s.matches_probe(&probe.info)))
+            .collect()
+    }
+}
+
+/// The address of the TCP probe a selector names, if it names one.
+fn tcp_address(selector: &DebugProbeSelector) -> Option<&str> {
+    if selector.vendor_id != tcp::TCP_VID || selector.product_id != tcp::TCP_PID {
+        return None;
+    }
+    selector
+        .serial_number
+        .as_deref()
+        .filter(|address| !address.is_empty())
 }
 
 /// A CMSIS-DAP probe.
@@ -108,10 +161,17 @@ pub struct CmsisDap {
     /// Speed in kHz
     speed_khz: u32,
 
-    batch: Vec<BatchCommand>,
+    transfer_wait_retry: u16,
 
-    jtag_state: JtagDriverState,
-    jtag_buffer: JtagBuffer,
+    jtag_state: JtagChainState,
+    reset_line: ResetLine,
+
+    /// Whether the probe got the scan chain with `DAP_JTAG_Configure` since it connected.
+    /// `DAP_Transfer` over JTAG needs it.
+    jtag_configured: bool,
+
+    /// The last value written to DP SELECT. Its DP bank decides what DP address 0x4 reaches.
+    dp_select: u32,
 }
 
 impl std::fmt::Debug for CmsisDap {
@@ -129,26 +189,52 @@ impl std::fmt::Debug for CmsisDap {
     }
 }
 
+/// Times the opening sequence is restarted while the probe is still answering with replies it owes
+/// from an earlier session.
+const MAX_OPEN_ATTEMPTS: usize = 8;
+
+/// How long the probe has to stay silent before its backlog counts as drained, once one has been
+/// seen. Only paid on the recovery path.
+const BACKLOG_IDLE: Duration = Duration::from_millis(100);
+
+/// What `new_from_device` asks the probe about itself.
+struct ProbeInfo {
+    packet_count: u8,
+    capabilities: Capabilities,
+    swo_buffer_size: Option<usize>,
+}
+
 impl CmsisDap {
     fn new_from_device(mut device: CmsisDapDevice) -> Result<Self, DebugProbeError> {
         // Discard anything left in buffer, as otherwise
         // we'll get out of sync between requests and responses.
         device.drain();
 
-        // Determine and set the packet size. We do this as soon as possible after
-        // opening the probe to ensure all future communication uses the correct size.
+        // Before anything else is asked of the probe. Until this returns, the size a report has to
+        // be to reach the device is a guess -- and some answer nothing at all until they receive a
+        // full one, which is what the retrying inside here is for. Anything sent before it can go
+        // unanswered on those probes for reasons that have nothing to do with the probe's state.
         let packet_size = device.find_packet_size()? as u16;
 
-        // Read remaining probe information.
-        let packet_count = commands::send_command(&mut device, &PacketCountCommand {})?;
-        let caps: Capabilities = commands::send_command(&mut device, &CapabilitiesCommand {})?;
-        tracing::debug!("Detected probe capabilities: {:?}", caps);
-        let mut swo_buffer_size = None;
-        if caps.swo_uart_implemented || caps.swo_manchester_implemented {
-            let swo_size = commands::send_command(&mut device, &SWOTraceBufferSizeCommand {})?;
-            swo_buffer_size = Some(swo_size as usize);
-            tracing::debug!("Probe SWO buffer size: {}", swo_size);
+        // A probe that still owes replies from an earlier session answers the start of this one
+        // with the previous one's data. Drain properly, prompt out what it is holding, and ask
+        // again for as long as the answers look like they belong to someone else.
+        let mut info = Self::read_probe_info(&mut device);
+        for _ in 1..MAX_OPEN_ATTEMPTS {
+            if !matches!(&info, Err(e) if commands::reply_is_not_ours(e)) {
+                break;
+            }
+
+            device.drain_idle_for(BACKLOG_IDLE);
+            device.resynchronise();
+            info = Self::read_probe_info(&mut device);
         }
+
+        let ProbeInfo {
+            packet_count,
+            capabilities: caps,
+            swo_buffer_size,
+        } = info?;
 
         Ok(Self {
             device,
@@ -163,9 +249,44 @@ impl CmsisDap {
             swo_streaming: false,
             connected: false,
             speed_khz: 1_000,
-            batch: Vec::new(),
-            jtag_state: JtagDriverState::default(),
-            jtag_buffer: JtagBuffer::new(packet_size - 1),
+            transfer_wait_retry: 0,
+            jtag_state: JtagChainState::default(),
+            reset_line: ResetLine::default(),
+            jtag_configured: false,
+            dp_select: 0,
+        })
+    }
+
+    fn read_probe_info(device: &mut CmsisDapDevice) -> Result<ProbeInfo, CmsisDapError> {
+        // Read remaining probe information.
+        let packet_count = commands::send_command_once(device, &PacketCountCommand {})?;
+        tracing::debug!("Probe buffers {} packets", packet_count);
+
+        let capabilities: Capabilities =
+            commands::send_command_once(device, &CapabilitiesCommand {})?;
+        tracing::debug!("Detected probe capabilities: {:?}", capabilities);
+
+        let mut swo_buffer_size = None;
+        if capabilities.swo_uart_implemented || capabilities.swo_manchester_implemented {
+            let swo_size = commands::send_command_once(device, &SWOTraceBufferSizeCommand {})?;
+            swo_buffer_size = Some(swo_size as usize);
+            tracing::debug!("Probe SWO buffer size: {}", swo_size);
+        }
+
+        // Nothing above can tell its own answer from one the probe still owed. Every `DAP_Info`
+        // sub-command shares command ID 0x00 and the reply does not say which one it answers, so
+        // a stale packet count reads as a capability mask and the probe comes out not supporting
+        // SWD. A command with a different ID does say: if anything was queued ahead of it, its
+        // reply arrives under the wrong ID, and everything read above came from the backlog.
+        commands::ignore_unknown_command(commands::send_command_once(
+            device,
+            &HostStatusRequest::connected(false),
+        ))?;
+
+        Ok(ProbeInfo {
+            packet_count,
+            capabilities,
+            swo_buffer_size,
         })
     }
 
@@ -183,6 +304,7 @@ impl CmsisDap {
     }
 
     fn transfer_configure(&mut self, request: ConfigureRequest) -> Result<(), CmsisDapError> {
+        self.transfer_wait_retry = request.wait_retry;
         commands::send_command(&mut self.device, &request).and_then(|v| match v.status {
             Status::DapOk => Ok(()),
             Status::DapError => Err(CmsisDapError::ErrorResponse(
@@ -478,7 +600,39 @@ impl CmsisDap {
     }
 
     fn write_abort(&mut self, abort: Abort) -> Result<(), ArmError> {
-        let mut request = TransferRequest::write(Abort::ADDRESS, abort.into());
+        if self.protocol == Some(WireProtocol::Jtag) {
+            // A JTAG-DP has only DAPABORT, and clears its sticky flags through CTRL/STAT. The
+            // abort goes first, because CTRL/STAT answers WAIT while an AP transaction is stuck.
+            let value = u32::from(abort);
+            if value & 1 != 0 {
+                let request = WriteAbortRequest {
+                    dap_index: self.jtag_state.chain_params.index as u8,
+                    value: 1,
+                };
+                let response = commands::send_command(&mut self.device, &request)
+                    .map_err(DebugProbeError::from)?;
+                if response.status == Status::DapError {
+                    return Err(DebugProbeError::from(CmsisDapError::ErrorResponse(
+                        RequestError::WriteAbort { request },
+                    ))
+                    .into());
+                }
+            }
+            if value & !1 != 0 {
+                self.clear_jtag_sticky_err()?;
+            }
+            return Ok(());
+        }
+
+        self.write_dp_register(Abort::ADDRESS, abort.into())
+    }
+
+    fn write_dp_register(
+        &mut self,
+        address: DpRegisterAddress,
+        value: u32,
+    ) -> Result<(), ArmError> {
+        let mut request = TransferRequest::write(address, value);
         request.dap_index = self.jtag_state.chain_params.index as u8;
         let response =
             commands::send_command(&mut self.device, &request).map_err(DebugProbeError::from)?;
@@ -521,144 +675,6 @@ impl CmsisDap {
                 })
             }
             Err(e) => Err(e),
-        }
-    }
-
-    /// Immediately send whatever is in our batch if it is not empty.
-    ///
-    /// If the last transfer was a read, result is Some with the read value.
-    /// Otherwise, the result is None.
-    ///
-    /// This will ensure any pending writes are processed and errors from them
-    /// raised if necessary.
-    #[tracing::instrument(skip(self))]
-    fn process_batch(&mut self) -> Result<Option<u32>, ArmError> {
-        let batch = std::mem::take(&mut self.batch);
-        if batch.is_empty() {
-            return Ok(None);
-        }
-
-        tracing::debug!("{} items in batch", batch.len());
-
-        let mut transfers = TransferRequest::empty();
-        transfers.dap_index = self.jtag_state.chain_params.index as u8;
-        for command in batch.iter().cloned() {
-            match command {
-                BatchCommand::Read(port) => {
-                    transfers.add_read(port);
-                }
-                BatchCommand::Write(port, value) => {
-                    transfers.add_write(port, value);
-                }
-            }
-        }
-
-        let response =
-            commands::send_command(&mut self.device, &transfers).map_err(DebugProbeError::from)?;
-
-        let count = response.transfers.len();
-
-        tracing::debug!("{} of batch of {} items executed", count, batch.len());
-
-        if response.last_transfer_response.protocol_error {
-            tracing::warn!(
-                "Protocol error in response to command {}",
-                batch[count.saturating_sub(1)]
-            );
-
-            return Err(DapError::Protocol(
-                self.protocol
-                    .expect("A wire protocol should have been selected by now"),
-            )
-            .into());
-        }
-
-        match response.last_transfer_response.ack {
-            Ack::Ok => {
-                // If less transfers than expected were executed, this
-                // is not the response to the latest command from the batch.
-                //
-                // According to the CMSIS-DAP specification, this shouldn't happen,
-                // the only time when not all transfers were executed is when an error occurred.
-                // Still, this seems to happen in practice.
-
-                if count < batch.len() {
-                    tracing::warn!(
-                        "CMSIS_DAP: Only {}/{} transfers were executed, but no error was reported.",
-                        count,
-                        batch.len()
-                    );
-                    return Err(DebugProbeError::Other(format!(
-                        "Possible error in CMSIS-DAP probe: Only {}/{} transfers were executed, but no error was reported.",
-                        count,
-                        batch.len()
-                    )).into());
-                }
-
-                tracing::trace!("Last transfer status: ACK");
-                Ok(response.transfers[count - 1].data)
-            }
-            Ack::NoAck => {
-                tracing::debug!(
-                    "Transfer status for batch item {}/{}: NACK",
-                    count,
-                    batch.len()
-                );
-                // TODO: Try a reset?
-                Err(DapError::NoAcknowledge.into())
-            }
-            Ack::Fault => {
-                tracing::debug!(
-                    "Transfer status for batch item {}/{}: FAULT",
-                    count,
-                    batch.len()
-                );
-
-                // To avoid a potential endless recursion,
-                // call a separate function to read the ctrl register,
-                // which doesn't use the batch API.
-                self.handle_sticky_err()?;
-
-                Err(DapError::FaultResponse.into())
-            }
-            Ack::Wait => {
-                tracing::debug!(
-                    "Transfer status for batch item {}/{}: WAIT",
-                    count,
-                    batch.len()
-                );
-
-                self.write_abort({
-                    let mut abort = Abort(0);
-                    abort.set_dapabort(true);
-                    abort
-                })?;
-
-                Err(DapError::WaitResponse.into())
-            }
-        }
-    }
-
-    /// Add a BatchCommand to our current batch.
-    ///
-    /// If the BatchCommand is a Read, this will immediately process the batch
-    /// and return the read value. If the BatchCommand is a write, the write is
-    /// executed immediately if the batch is full, otherwise it is queued for
-    /// later execution.
-    fn batch_add(&mut self, command: BatchCommand) -> Result<Option<u32>, ArmError> {
-        tracing::debug!("Adding command to batch: {}", command);
-
-        let command_is_read = matches!(command, BatchCommand::Read(_));
-        self.batch.push(command);
-
-        // We always immediately process any reads, which means there will never
-        // be more than one read in a batch. We also process whenever the batch
-        // is as long as can fit in one packet.
-        let max_writes = (self.packet_size as usize - 3) / (1 + 4);
-        if command_is_read || self.batch.len() == max_writes {
-            self.process_batch()
-        } else {
-            Ok(None)
         }
     }
 
@@ -813,85 +829,58 @@ impl CmsisDap {
             .ok();
         }
         self.connected = true;
+        self.jtag_configured = false;
 
         Ok(())
     }
 
-    fn handle_transfer_block_response(
-        &mut self,
-        address: RegisterAddress,
-        resp: &TransferBlockResponse,
-        executed_transfers: usize,
-        total_transfers: usize,
-    ) -> Result<(), ArmError> {
-        if resp.transfer_response.protocol_error {
-            tracing::warn!(
-                "Protocol error in block read from register {:?}, read {}/{}",
-                address,
-                executed_transfers,
-                total_transfers,
-            );
+    pub(crate) fn configure_jtag(&mut self, skip_scan: bool) -> Result<(), DebugProbeError> {
+        // Until the new chain is in the probe, the old one may not describe the target.
+        self.jtag_configured = false;
 
-            // TODO: Indicate which transfer failed
-            return Err(
-                DapError::Protocol(self.protocol.expect("Protocol has been selected")).into(),
-            );
-        }
+        let ir_lengths = if skip_scan {
+            let expected = self
+                .jtag_state
+                .expected_scan_chain
+                .clone()
+                .unwrap_or_default();
 
-        match resp.transfer_response.ack {
-            // TODO: Handle this the same way as process_batch
-            Ack::Ok => Ok(()),
-            Ack::Fault => {
-                // TODO: Perform error handling -> clear fault, etc.
-                //
-                // TODO: Properly track what exactly failed
-                tracing::debug!(
-                    "FAULT response in block read from register {:?}, read {}/{}",
-                    address,
-                    executed_transfers,
-                    total_transfers,
-                );
-
-                // To avoid a potential endless recursion,
-                // call a separate function to read the ctrl register,
-                // which doesn't use the batch API.
-                self.handle_sticky_err()?;
-
-                Err(DapError::FaultResponse.into())
+            self.jtag_state.scan_chain = expected.clone();
+            self.jtag_state.idcodes.clear();
+            let selected = self.jtag_state.chain_params.index;
+            if let Some(params) = crate::probe::jtag::ChainParams::from_jtag_chain(
+                &self.jtag_state.scan_chain,
+                selected,
+            ) {
+                tracing::debug!("Re-measured chain params after reconfigure: {params:?}");
+                self.jtag_state.chain_params = params;
             }
-            Ack::NoAck => {
-                // TODO: Perform error handling -> clear fault, etc.
-                //
-                // TODO: Properly track what exactly failed
-                tracing::debug!(
-                    "NACK response in block read from register {:?}, read {}/{}",
-                    address,
-                    executed_transfers,
-                    total_transfers
-                );
-                // TODO: Try a reset?
-                Err(DapError::NoAcknowledge.into())
-            }
-            Ack::Wait => {
-                // TODO: Perform error handling -> clear fault, etc.
-                //
-                // TODO: Properly track what exactly failed
-                tracing::debug!(
-                    "WAIT response in block read from register {:?}, read {}/{}",
-                    address,
-                    executed_transfers,
-                    total_transfers
-                );
 
-                self.write_abort({
-                    let mut abort = Abort(0);
-                    abort.set_dapabort(true);
-                    abort
-                })?;
+            expected
+                .iter()
+                .filter_map(|s| s.ir_len)
+                .collect::<Vec<u8>>()
+        } else {
+            let chain = self.jtag_scan(
+                self.jtag_state
+                    .expected_scan_chain
+                    .as_ref()
+                    .map(|chain| {
+                        chain
+                            .iter()
+                            .filter_map(|s| s.ir_len)
+                            .map(|s| s as usize)
+                            .collect::<Vec<usize>>()
+                    })
+                    .as_deref(),
+            )?;
+            chain.iter().map(|item| item.ir_len()).collect()
+        };
+        tracing::info!("Configuring JTAG with ir lengths: {:?}", ir_lengths);
+        self.send_jtag_configure(JtagConfigureRequest::new(ir_lengths)?)?;
+        self.jtag_configured = true;
 
-                Err(DapError::WaitResponse.into())
-            }
-        }
+        Ok(())
     }
 }
 
@@ -904,6 +893,13 @@ impl DebugProbe for CmsisDap {
                 handle.descriptor()
             )
             .leak(),
+
+            CmsisDapDevice::Tcp { device, .. } => {
+                format!("CMSIS-DAP TCP {}", device.address()).leak()
+            }
+
+            #[cfg(test)]
+            CmsisDapDevice::Fake(_) => "CMSIS-DAP fake",
 
             #[cfg(feature = "cmsisdap_v1")]
             _ => "CMSIS-DAP V1",
@@ -963,8 +959,6 @@ impl DebugProbe for CmsisDap {
 
     /// Leave debug mode.
     fn detach(&mut self) -> Result<(), crate::Error> {
-        self.process_batch()?;
-
         if self.swo_active {
             self.disable_swo()?;
         }
@@ -977,6 +971,7 @@ impl DebugProbe for CmsisDap {
         let _: Result<HostStatusResponse, _> = commands::send_command(&mut self.device, &request);
 
         self.connected = false;
+        self.jtag_configured = false;
 
         match response {
             DisconnectResponse(Status::DapOk) => Ok(()),
@@ -987,6 +982,7 @@ impl DebugProbe for CmsisDap {
     }
 
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {
+        self.jtag_configured = false;
         match protocol {
             WireProtocol::Jtag if self.capabilities.jtag_implemented => {
                 self.protocol = Some(WireProtocol::Jtag);
@@ -1006,6 +1002,7 @@ impl DebugProbe for CmsisDap {
 
     /// Asserts the nRESET pin.
     fn target_reset(&mut self) -> Result<(), DebugProbeError> {
+        self.reset_line.check_assert()?;
         commands::send_command(&mut self.device, &ResetRequest).map(|v: ResetResponse| {
             tracing::info!("Target reset response: {:?}", v);
         })?;
@@ -1013,6 +1010,7 @@ impl DebugProbe for CmsisDap {
     }
 
     fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
+        self.reset_line.check_assert()?;
         let request = SWJPinsRequestBuilder::new().nreset(false).build();
 
         commands::send_command(&mut self.device, &request).map(|v: SWJPinsResponse| {
@@ -1030,6 +1028,10 @@ impl DebugProbe for CmsisDap {
         Ok(())
     }
 
+    fn set_reset_line_connected(&mut self, connected: bool) {
+        self.reset_line.set_connected(connected);
+    }
+
     fn get_swo_interface(&self) -> Option<&dyn SwoAccess> {
         Some(self as _)
     }
@@ -1042,7 +1044,11 @@ impl DebugProbe for CmsisDap {
         self: Box<Self>,
         sequence: Arc<dyn ArmDebugSequence>,
     ) -> Result<Box<dyn ArmDebugInterface + 'probe>, (Box<dyn DebugProbe>, ArmError)> {
-        Ok(ArmCommunicationInterface::create(self, sequence, false))
+        Ok(ArmCommunicationInterface::create(
+            Box::new(CmsisDapTransport(self)),
+            sequence,
+            false,
+        ))
     }
 
     fn has_arm_interface(&self) -> bool {
@@ -1053,12 +1059,23 @@ impl DebugProbe for CmsisDap {
         self
     }
 
-    fn try_as_jtag_probe(&mut self) -> Option<&mut dyn JtagAccess> {
+    fn try_as_jtag_chain(&mut self) -> Option<JtagChain<'_>> {
+        Some(JtagChain::new(self))
+    }
+
+    fn try_as_swd_probe_mut(&mut self) -> Option<&mut dyn SwdProbe> {
         Some(self)
     }
 
-    fn try_as_dap_probe(&mut self) -> Option<&mut dyn DapProbe> {
+    fn try_as_jtag_chain_access_mut(&mut self) -> Option<&mut dyn JtagChainAccess> {
         Some(self)
+    }
+
+    fn try_as_swd_probe(self: Box<Self>) -> Result<Box<dyn SwdProbe>, Box<dyn DebugProbe>> {
+        match self.protocol {
+            Some(WireProtocol::Jtag) => Err(self.into_probe()),
+            _ => Ok(self),
+        }
     }
 
     fn has_riscv_interface(&self) -> bool {
@@ -1082,209 +1099,13 @@ impl DebugProbe for CmsisDap {
     fn has_xtensa_interface(&self) -> bool {
         true
     }
-}
 
-// TODO: we will want to replace the default implementation with one that can use vendor extensions.
-impl AutoImplementJtagAccess for CmsisDap {}
-
-impl RawDapAccess for CmsisDap {
     fn core_status_notification(&mut self, status: CoreStatus) -> Result<(), DebugProbeError> {
         let running = status.is_running();
         commands::send_command(&mut self.device, &HostStatusRequest::running(running))?;
         Ok(())
     }
-
-    /// Reads the DAP register on the specified port and address.
-    fn raw_read_register(&mut self, address: RegisterAddress) -> Result<u32, ArmError> {
-        let res = self.batch_add(BatchCommand::Read(address))?;
-
-        // NOTE(unwrap): batch_add will always return Some if the last command is a read
-        // and running the batch was successful.
-        Ok(res.unwrap())
-    }
-
-    /// Writes a value to the DAP register on the specified port and address.
-    fn raw_write_register(&mut self, address: RegisterAddress, value: u32) -> Result<(), ArmError> {
-        self.batch_add(BatchCommand::Write(address, value))
-            .map(|_| ())
-    }
-
-    fn raw_write_block(
-        &mut self,
-        address: RegisterAddress,
-        values: &[u32],
-    ) -> Result<(), ArmError> {
-        self.process_batch()?;
-
-        // the overhead for a single packet is 6 bytes
-        //
-        // [0]: HID overhead
-        // [1]: Category
-        // [2]: DAP Index
-        // [3]: Len 1
-        // [4]: Len 2
-        // [5]: Request type
-        //
-
-        let max_packet_size_words = (self.packet_size - 6) / 4;
-
-        let data_chunk_len = max_packet_size_words as usize;
-
-        let total_writes = values.len();
-
-        for (i, chunk) in values.chunks(data_chunk_len).enumerate() {
-            let mut request = TransferBlockRequest::write_request(address, Vec::from(chunk));
-            request.dap_index = self.jtag_state.chain_params.index as u8;
-
-            tracing::debug!("Transfer block: chunk={}, len={} bytes", i, chunk.len() * 4);
-
-            let resp: TransferBlockResponse = commands::send_command(&mut self.device, &request)
-                .map_err(DebugProbeError::from)?;
-
-            let executed_writes = i * data_chunk_len + usize::from(resp.transfer_count);
-
-            self.handle_transfer_block_response(address, &resp, executed_writes, total_writes)?;
-        }
-
-        Ok(())
-    }
-
-    fn raw_read_block(
-        &mut self,
-        address: RegisterAddress,
-        values: &mut [u32],
-    ) -> Result<(), ArmError> {
-        self.process_batch()?;
-
-        // the overhead for a single packet is 6 bytes
-        //
-        // [0]: HID overhead
-        // [1]: Category
-        // [2]: DAP Index
-        // [3]: Len 1
-        // [4]: Len 2
-        // [5]: Request type
-        //
-
-        let max_packet_size_words = (self.packet_size - 6) / 4;
-
-        let data_chunk_len = max_packet_size_words as usize;
-
-        let total_num_reads = values.len();
-
-        for (i, chunk) in values.chunks_mut(data_chunk_len).enumerate() {
-            let mut request = TransferBlockRequest::read_request(address, chunk.len() as u16);
-            request.dap_index = self.jtag_state.chain_params.index as u8;
-
-            tracing::debug!("Transfer block: chunk={}, len={} bytes", i, chunk.len() * 4);
-
-            let resp: TransferBlockResponse = commands::send_command(&mut self.device, &request)
-                .map_err(DebugProbeError::from)?;
-
-            let executed_reads = i * data_chunk_len + usize::from(resp.transfer_count);
-
-            self.handle_transfer_block_response(address, &resp, executed_reads, total_num_reads)?;
-
-            chunk.clone_from_slice(&resp.transfer_data[..]);
-        }
-
-        Ok(())
-    }
-
-    fn raw_flush(&mut self) -> Result<(), ArmError> {
-        self.process_batch()?;
-        Ok(())
-    }
-
-    fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
-        self
-    }
-
-    fn configure_jtag(&mut self, skip_scan: bool) -> Result<(), DebugProbeError> {
-        let ir_lengths = if skip_scan {
-            self.jtag_state
-                .expected_scan_chain
-                .as_ref()
-                .map(|chain| chain.iter().filter_map(|s| s.ir_len).collect::<Vec<u8>>())
-                .unwrap_or_default()
-        } else {
-            let chain = self.jtag_scan(
-                self.jtag_state
-                    .expected_scan_chain
-                    .as_ref()
-                    .map(|chain| {
-                        chain
-                            .iter()
-                            .filter_map(|s| s.ir_len)
-                            .map(|s| s as usize)
-                            .collect::<Vec<usize>>()
-                    })
-                    .as_deref(),
-            )?;
-            chain.iter().map(|item| item.ir_len()).collect()
-        };
-        tracing::info!("Configuring JTAG with ir lengths: {:?}", ir_lengths);
-        self.send_jtag_configure(JtagConfigureRequest::new(ir_lengths)?)?;
-
-        Ok(())
-    }
-
-    fn jtag_sequence(&mut self, cycles: u8, tms: bool, tdi: u64) -> Result<(), DebugProbeError> {
-        self.connect_if_needed()?;
-
-        let tdi_bytes = tdi.to_le_bytes();
-        let sequence = JtagSequence::new(cycles, false, tms, tdi_bytes)?;
-        let sequences = vec![sequence];
-
-        self.send_jtag_sequences(JtagSequenceRequest::new(sequences)?)?;
-
-        Ok(())
-    }
-
-    fn swj_sequence(&mut self, bit_len: u8, bits: u64) -> Result<(), DebugProbeError> {
-        self.connect_if_needed()?;
-
-        let data = bits.to_le_bytes();
-
-        if tracing::enabled!(tracing::Level::TRACE) {
-            let mut seq = String::new();
-
-            let _ = write!(&mut seq, "swj sequence:");
-
-            for i in 0..bit_len {
-                let bit = (bits >> i) & 1;
-
-                if bit == 1 {
-                    let _ = write!(&mut seq, "1");
-                } else {
-                    let _ = write!(&mut seq, "0");
-                }
-            }
-            tracing::trace!("{}", seq);
-        }
-
-        self.send_swj_sequences(SequenceRequest::new(&data, bit_len)?)?;
-
-        Ok(())
-    }
-
-    fn swj_pins(
-        &mut self,
-        pin_out: u32,
-        pin_select: u32,
-        pin_wait: u32,
-    ) -> Result<u32, DebugProbeError> {
-        self.connect_if_needed()?;
-
-        let request = SWJPinsRequest::from_raw_values(pin_out as u8, pin_select as u8, pin_wait);
-
-        let Pins(response) = commands::send_command(&mut self.device, &request)?;
-
-        Ok(response as u32)
-    }
 }
-
-impl DapProbe for CmsisDap {}
 
 impl SwoAccess for CmsisDap {
     fn enable_swo(&mut self, config: &SwoConfig) -> Result<(), ArmError> {
@@ -1391,11 +1212,6 @@ impl SwoAccess for CmsisDap {
 impl Drop for CmsisDap {
     fn drop(&mut self) {
         tracing::debug!("Detaching from CMSIS-DAP probe");
-        // We ignore the error cases as we can't do much about it anyways.
-        let _ = self.process_batch();
-
-        // If SWO is active, disable it before calling detach,
-        // which ensures detach won't error on disabling SWO.
         if self.swo_active {
             let _ = self.disable_swo();
         }
@@ -1410,5 +1226,140 @@ impl From<ScanChainError> for CmsisDapError {
             ScanChainError::InvalidIdCode => CmsisDapError::InvalidIdCode,
             ScanChainError::InvalidIR => CmsisDapError::InvalidIR,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use super::commands::{
+        self, CmsisDapDevice, CmsisDapError, CommandId, DEFAULT_USB_TIMEOUT, SendError,
+        fake::{FakeProbe, Reply, standard_reply},
+        ignore_unknown_command,
+    };
+    use super::commands::{Request, general::info::PacketSizeCommand};
+    use super::{CapabilitiesCommand, CmsisDap, HostStatusResponse, PacketCountCommand};
+
+    fn failed(source: SendError) -> Result<HostStatusResponse, CmsisDapError> {
+        Err(CmsisDapError::Send {
+            command_id: CommandId::HostStatus,
+            source,
+        })
+    }
+
+    #[test]
+    fn only_an_unknown_command_reply_is_ignored() {
+        assert!(ignore_unknown_command(Ok(HostStatusResponse)).is_ok());
+        assert!(
+            ignore_unknown_command(failed(SendError::CommandIdMismatch(
+                0xFF,
+                CommandId::HostStatus
+            )))
+            .is_ok()
+        );
+        assert!(
+            ignore_unknown_command(failed(SendError::CommandIdMismatch(0xFF, CommandId::Info)))
+                .is_ok()
+        );
+        assert!(
+            ignore_unknown_command(failed(SendError::CommandIdMismatch(
+                0x00,
+                CommandId::HostStatus
+            )))
+            .is_err()
+        );
+        assert!(ignore_unknown_command(failed(SendError::Timeout)).is_err());
+    }
+
+    #[test]
+    fn a_late_reply_does_not_answer_the_next_command() {
+        late_reply_does_not_answer_the_next_command(true, PacketCountCommand {}, 1);
+    }
+
+    #[test]
+    fn a_late_reply_does_not_answer_the_next_command_when_the_abort_waits() {
+        // A late packet size next to the abort's `0xFF` would pass a check that accepts `0xFF`.
+        late_reply_does_not_answer_the_next_command(false, PacketSizeCommand {}, 2);
+    }
+
+    fn late_reply_does_not_answer_the_next_command(
+        abort_interrupts: bool,
+        late: impl Request,
+        rounds: usize,
+    ) {
+        let hold = Arc::new(AtomicBool::new(false));
+        let probe = FakeProbe::shared(64, {
+            let hold = hold.clone();
+            move |command| match command {
+                // A probe without `DAP_HostStatus` is in step all the same.
+                [0x01, ..] => Reply::Now(vec![0xFF]),
+                [0x07, ..] if !abort_interrupts => Reply::Now(vec![0xFF]),
+                _ => match standard_reply(command, 64, 4) {
+                    Reply::Now(reply) if hold.swap(false, Ordering::Relaxed) => Reply::Held(reply),
+                    reply => reply,
+                },
+            }
+        });
+        probe.lock().unwrap().abort_interrupts = abort_interrupts;
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+
+        hold.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            commands::send_command(&mut dap.device, &late),
+            Err(CmsisDapError::Send {
+                source: SendError::Timeout,
+                ..
+            })
+        ));
+
+        // A late `DAP_Info` reply would read as a capability mask without SWD.
+        let capabilities = commands::send_command(&mut dap.device, &CapabilitiesCommand {});
+        assert!(capabilities.unwrap().swd_implemented);
+        assert!(probe.lock().unwrap().owes_nothing());
+
+        let aborts = probe.lock().unwrap().aborts();
+        assert_eq!(aborts, rounds);
+        let usb_timeout = probe.lock().unwrap().usb_timeout;
+        assert_eq!(usb_timeout, DEFAULT_USB_TIMEOUT);
+    }
+
+    #[test]
+    fn a_silent_probe_is_given_up_after_one_round() {
+        let silent = Arc::new(AtomicBool::new(false));
+        let probe = FakeProbe::shared(64, {
+            let silent = silent.clone();
+            move |command| {
+                if silent.load(Ordering::Relaxed) {
+                    Reply::None
+                } else {
+                    standard_reply(command, 64, 4)
+                }
+            }
+        });
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+
+        silent.store(true, Ordering::Relaxed);
+        assert!(commands::send_command(&mut dap.device, &PacketCountCommand {}).is_err());
+
+        let aborts = probe.lock().unwrap().aborts();
+        assert_eq!(aborts, 1);
+        let usb_timeout = probe.lock().unwrap().usb_timeout;
+        assert_eq!(usb_timeout, DEFAULT_USB_TIMEOUT);
+    }
+
+    #[test]
+    fn a_retried_packet_size_keeps_the_usb_timeout() {
+        let mut answered = false;
+        let probe = FakeProbe::shared(64, move |command| match command {
+            [0x00, 0xFF, ..] if !std::mem::replace(&mut answered, true) => Reply::None,
+            _ => standard_reply(command, 64, 4),
+        });
+        let _dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+        let usb_timeout = probe.lock().unwrap().usb_timeout;
+        assert_eq!(usb_timeout, DEFAULT_USB_TIMEOUT);
     }
 }

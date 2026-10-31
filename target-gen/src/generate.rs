@@ -8,7 +8,8 @@ use probe_rs::flashing::FlashAlgorithm;
 use probe_rs_target::{
     Architecture, ArmCoreAccessOptions, Chip, ChipFamily, Core as ProbeCore, CoreAccessOptions,
     CoreType, GenericRegion, MemoryAccess, MemoryRegion, NvmRegion, RamRegion, RawFlashAlgorithm,
-    RiscvCoreAccessOptions, TargetDescriptionSource, XtensaCoreAccessOptions,
+    RiscvCoreAccessOptions, TargetDescriptionSource, XtensaCoreAccessOptions, XtensaCoreProperties,
+    XtensaWindowProperties,
 };
 use std::collections::HashMap;
 use std::io::BufReader;
@@ -170,12 +171,14 @@ where
             svd: None,
             documentation: HashMap::new(),
             package_variants: vec![],
+            memory_ports: vec![],
             cores,
             memory_map,
             flash_algorithms: flash_algorithm_names,
             rtt_scan_ranges: None,
             jtag: None, // TODO, parse scan chain from sdf
             default_binary_format: None,
+            skip_reset_on_ram_boot: false,
         });
     }
 
@@ -218,9 +221,15 @@ fn create_core(processor: &Processor) -> Result<ProbeCore> {
                 jtag_tap: None,
                 mem_ap: None,
             }),
-            Architecture::Xtensa => {
-                CoreAccessOptions::Xtensa(XtensaCoreAccessOptions { jtag_tap: None })
-            }
+            Architecture::Xtensa => CoreAccessOptions::Xtensa(XtensaCoreAccessOptions {
+                jtag_tap: None,
+                core_properties: XtensaCoreProperties {
+                    debug_level: 6,
+                    hw_breakpoint_num: 2,
+                    fpu: None,
+                    window_properties: Some(XtensaWindowProperties { num_aregs: 64 }),
+                },
+            }),
         },
     })
 }
@@ -294,7 +303,7 @@ pub fn visit_file(path: &Path, families: &mut Vec<ChipFamily>) -> Result<()> {
     let package = Package::from_string(&pdsc).map_err(|e| {
         anyhow!(
             "Failed to parse pdsc file '{}' in CMSIS Pack {}: {}",
-            pdsc_file.name(),
+            String::from_utf8_lossy(pdsc_file.name_raw()),
             path.display(),
             e
         )
@@ -405,13 +414,13 @@ pub(crate) async fn visit_arm_file(
         Err(error) => {
             log::error!(
                 "Failed to parse pdsc file '{}' in CMSIS Pack {url}: {error}",
-                pdsc_file.name(),
+                String::from_utf8_lossy(pdsc_file.name_raw()),
             );
             return vec![];
         }
     };
 
-    let pdsc_name = pdsc_file.name().to_owned();
+    let pdsc_name = String::from_utf8_lossy(pdsc_file.name_raw()).into_owned();
 
     drop(pdsc_file);
 
@@ -443,7 +452,7 @@ where
         let outpath = file.enclosed_name().ok_or_else(|| {
             anyhow!(
                 "Error handling the ZIP file content with path '{}': Path seems to be malformed",
-                file.name()
+                String::from_utf8_lossy(file.name_raw())
             )
         })?;
 
@@ -580,6 +589,7 @@ pub(crate) fn get_mem_map(device: &Device, cores: &[probe_rs_target::Core]) -> V
                         name: Some(region.name),
                         range: region.memory_start..region.memory_end,
                         cores,
+                        memory_ports: vec![],
                         is_alias: false,
                     }));
                 }
@@ -596,6 +606,7 @@ pub(crate) fn get_mem_map(device: &Device, cores: &[probe_rs_target::Core]) -> V
                         name: Some(region.name),
                         range: region.memory_start..region.memory_end,
                         cores,
+                        memory_ports: vec![],
                         is_alias: false,
                     }));
                 }
@@ -612,6 +623,7 @@ pub(crate) fn get_mem_map(device: &Device, cores: &[probe_rs_target::Core]) -> V
                         name: Some(region.name),
                         range: region.memory_start..region.memory_end,
                         cores,
+                        memory_ports: vec![]
                     }));
                 }
             },

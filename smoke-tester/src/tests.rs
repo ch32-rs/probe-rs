@@ -1,7 +1,6 @@
 use std::time::Instant;
 
 use anyhow::Context;
-use libtest_mimic::Failed;
 use linkme::distributed_slice;
 use probe_rs::{
     Architecture, Core, CoreInterface, MemoryInterface, Session,
@@ -37,9 +36,14 @@ fn test_register_write(_definition: &DutDefinition, core: &mut Core) -> TestResu
     let mut test_value = 1;
 
     for register in register.core_registers() {
-        // Skip register x0 on RISC-V chips, it's hardwired to zero.
-        if core.architecture() == Architecture::Riscv && register.name() == "x0" {
-            continue;
+        if core.architecture() == Architecture::Riscv {
+            match register.name() {
+                // Hardwired to zero.
+                "x0" => continue,
+                // Writing a trap CSR changes how the core resumes.
+                "mepc" | "mcause" | "mstatus" => continue,
+                _ => (),
+            }
         }
 
         if core.architecture() == Architecture::Arm {
@@ -281,7 +285,7 @@ fn test_hw_breakpoints(_definition: &DutDefinition, core: &mut Core) -> TestResu
 }
 
 #[smoke_tester_macros::test(session)]
-pub fn test_flashing(dut_definition: &DutDefinition, session: &mut Session) -> Result<(), Failed> {
+pub fn test_flashing(dut_definition: &DutDefinition, session: &mut Session) -> TestResult {
     let Some(test_binary) = dut_definition.flash_test_binary.as_deref() else {
         skip_test!("No flash test binary specified");
     };
