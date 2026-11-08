@@ -1,0 +1,1 @@
+RISC-V: autoexec is now detected from the `autoexecdata` bits that the memory paths use. Debug modules that implement data-register autoexec but not the program-buffer variant, such as WCH QingKe, previously fell back to one abstract command per word.

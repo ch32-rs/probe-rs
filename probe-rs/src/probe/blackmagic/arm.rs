@@ -1,27 +1,29 @@
 use crate::MemoryInterface;
 use crate::architecture::arm::{
-    ApAddress, ApV2Address, ArmDebugInterface, DapAccess, FullyQualifiedApAddress, RawDapAccess,
-    SwoAccess,
+    ApAddress, ApV2Address, ArmDebugInterface, DapAccess, FullyQualifiedApAddress, SwoAccess,
     ap::{
         self, AccessPortType, AddressIncrement, CSW, DataSize,
         memory_ap::{MemoryAp, MemoryApType},
         v1::valid_access_ports,
     },
-    communication_interface::{DapProbe, DpState, SelectCache, SwdSequence},
+    communication_interface::{
+        DpState, SelectCache, SwdSequence, probe_debug_port_wire, raw_pin_levels,
+    },
     dp::{
         Ctrl, DPIDR, DebugPortError, DebugPortId, DebugPortVersion, DpAccess, DpAddress,
         DpRegisterAddress, Select1, SelectV3,
     },
     memory::ArmMemoryInterface,
     sequences::ArmDebugSequence,
+    traits::Pins,
 };
 use crate::probe::blackmagic::{
     Accelerators, Align, BlackMagicProbe, ProtocolVersion, RemoteCommand,
 };
-use crate::probe::{ArmError, DebugProbeError, Probe};
+use crate::probe::{ArmError, BitSequence, DebugProbeError, Probe};
 use std::collections::BTreeSet;
 use std::collections::hash_map;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use zerocopy::IntoBytes;
 
 #[derive(Debug)]
@@ -91,19 +93,23 @@ impl BlackMagicProbeArmDebug {
 
             switched_dp = true;
 
-            self.probe.raw_flush()?;
-
             // We are not currently connected to any DP,
             // so we need to run the debug_port_setup sequence.
             if self.current_dp.is_none() {
-                sequence.debug_port_setup(&mut *self.probe, dp)?;
+                probe_debug_port_wire(&mut *self.probe, |wire| {
+                    sequence.debug_port_setup(wire, dp)
+                })?;
             } else {
                 // Try to switch to the new DP.
-                if let Err(e) = sequence.debug_port_connect(&mut *self.probe, dp) {
+                if let Err(e) = probe_debug_port_wire(&mut *self.probe, |wire| {
+                    sequence.debug_port_connect(wire, dp)
+                }) {
                     tracing::warn!("Failed to switch to DP {:x?}: {}", dp, e);
 
                     // Try the more involved debug_port_setup sequence, which also handles dormant mode.
-                    sequence.debug_port_setup(&mut *self.probe, dp)?;
+                    probe_debug_port_wire(&mut *self.probe, |wire| {
+                        sequence.debug_port_setup(wire, dp)
+                    })?;
                 }
             }
 
@@ -240,105 +246,105 @@ impl ArmDebugInterface for BlackMagicProbeArmDebug {
             MemoryAp::AmbaAhb3(ap) => {
                 let mut csw = ap.status(self)?;
 
-                csw.DbgSwEnable = true;
-                csw.AddrInc = AddressIncrement::Off;
-                csw.Size = DataSize::U8;
+                csw.set_DbgSwEnable(true);
+                csw.set_AddrInc(AddressIncrement::Off);
+                csw.set_Size(DataSize::U8);
 
-                csw.MasterType = true;
-                csw.Privileged = true;
-                csw.Data = true;
+                csw.set_MasterType(true);
+                csw.set_Privileged(true);
+                csw.set_Data(true);
 
-                csw.Allocate = false;
-                csw.Cacheable = false;
-                csw.Bufferable = false;
+                csw.set_Allocate(false);
+                csw.set_Cacheable(false);
+                csw.set_Bufferable(false);
 
                 // Enable secure access if it's allowed
-                csw.HNONSEC = !csw.SPIDEN;
+                csw.set_HNONSEC(!csw.SPIDEN());
 
                 CSW::try_from(Into::<u32>::into(csw))?
             }
             MemoryAp::AmbaAhb5(ap) => {
                 let mut csw = ap.status(self)?;
 
-                csw.DbgSwEnable = true;
-                csw.AddrInc = AddressIncrement::Off;
-                csw.Size = DataSize::U8;
+                csw.set_DbgSwEnable(true);
+                csw.set_AddrInc(AddressIncrement::Off);
+                csw.set_Size(DataSize::U8);
 
-                csw.MasterType = true;
-                csw.Data = true;
-                csw.Privileged = true;
+                csw.set_MasterType(true);
+                csw.set_Data(true);
+                csw.set_Privileged(true);
 
                 // Enable secure access if it's allowed
-                csw.HNONSEC = !csw.SPIDEN;
+                csw.set_HNONSEC(!csw.SPIDEN());
 
                 CSW::try_from(Into::<u32>::into(csw))?
             }
             MemoryAp::AmbaAhb5Hprot(ap) => {
                 let mut csw = ap.status(self)?;
 
-                csw.DbgSwEnable = true;
-                csw.AddrInc = AddressIncrement::Off;
-                csw.Size = DataSize::U8;
+                csw.set_DbgSwEnable(true);
+                csw.set_AddrInc(AddressIncrement::Off);
+                csw.set_Size(DataSize::U8);
 
-                csw.MasterType = true;
-                csw.Data = true;
-                csw.Privileged = true;
+                csw.set_MasterType(true);
+                csw.set_Data(true);
+                csw.set_Privileged(true);
 
                 // Enable secure access if it's allowed
-                csw.HNONSEC = !csw.SPIDEN;
+                csw.set_HNONSEC(!csw.SPIDEN());
 
                 CSW::try_from(Into::<u32>::into(csw))?
             }
             MemoryAp::AmbaApb2Apb3(ap) => {
                 let mut csw = ap.status(self)?;
 
-                csw.DbgSwEnable = true;
-                csw.AddrInc = AddressIncrement::Off;
-                csw.Size = DataSize::U8;
+                csw.set_DbgSwEnable(true);
+                csw.set_AddrInc(AddressIncrement::Off);
+                csw.set_Size(DataSize::U8);
 
                 CSW::try_from(Into::<u32>::into(csw))?
             }
             MemoryAp::AmbaApb4Apb5(ap) => {
                 let mut csw = ap.status(self)?;
 
-                csw.DbgSwEnable = true;
-                csw.AddrInc = AddressIncrement::Off;
-                csw.Size = DataSize::U8;
+                csw.set_DbgSwEnable(true);
+                csw.set_AddrInc(AddressIncrement::Off);
+                csw.set_Size(DataSize::U8);
 
                 // Enable secure access if it's allowed
-                csw.NonSecure = !csw.SPIDEN;
-                csw.Privileged = true;
+                csw.set_NonSecure(!csw.SPIDEN());
+                csw.set_Privileged(true);
 
                 CSW::try_from(Into::<u32>::into(csw))?
             }
             MemoryAp::AmbaAxi3Axi4(ap) => {
                 let mut csw = ap.status(self)?;
 
-                csw.DbgSwEnable = true;
-                csw.AddrInc = AddressIncrement::Off;
-                csw.Size = DataSize::U8;
+                csw.set_DbgSwEnable(true);
+                csw.set_AddrInc(AddressIncrement::Off);
+                csw.set_Size(DataSize::U8);
 
-                csw.Instruction = false;
+                csw.set_Instruction(false);
                 // Enable secure access if it's allowed
-                csw.NonSecure = !csw.SPIDEN;
-                csw.Privileged = true;
-                csw.CACHE = 0;
+                csw.set_NonSecure(!csw.SPIDEN());
+                csw.set_Privileged(true);
+                csw.set_CACHE(0);
 
                 CSW::try_from(Into::<u32>::into(csw))?
             }
             MemoryAp::AmbaAxi5(ap) => {
                 let mut csw = ap.status(self)?;
 
-                csw.DbgSwEnable = true;
-                csw.AddrInc = AddressIncrement::Off;
-                csw.Size = DataSize::U8;
+                csw.set_DbgSwEnable(true);
+                csw.set_AddrInc(AddressIncrement::Off);
+                csw.set_Size(DataSize::U8);
 
-                csw.Instruction = false;
+                csw.set_Instruction(false);
                 // Enable secure access if it's allowed
-                csw.NonSecure = !csw.SPIDEN;
-                csw.Privileged = true;
-                csw.CACHE = 0;
-                csw.MTE = false;
+                csw.set_NonSecure(!csw.SPIDEN());
+                csw.set_Privileged(true);
+                csw.set_CACHE(0);
+                csw.set_MTE(false);
 
                 CSW::try_from(Into::<u32>::into(csw))?
             }
@@ -360,13 +366,15 @@ impl ArmDebugInterface for BlackMagicProbeArmDebug {
         };
 
         // Switch to the correct mode
-        sequence.debug_port_setup(&mut *self.probe, dp)?;
+        probe_debug_port_wire(&mut *self.probe, |wire| sequence.debug_port_setup(wire, dp))?;
 
-        if let Err(e) = sequence.debug_port_connect(&mut *self.probe, dp) {
+        if let Err(e) = probe_debug_port_wire(&mut *self.probe, |wire| {
+            sequence.debug_port_connect(wire, dp)
+        }) {
             tracing::warn!("failed to switch to DP {:x?}: {}", dp, e);
 
             // Try the more involved debug_port_setup sequence, which also handles dormant mode.
-            sequence.debug_port_setup(&mut *self.probe, dp)?;
+            probe_debug_port_wire(&mut *self.probe, |wire| sequence.debug_port_setup(wire, dp))?;
         }
 
         self.debug_port_start(dp)?;
@@ -389,11 +397,15 @@ impl ArmDebugInterface for BlackMagicProbeArmDebug {
             self.current_dp = Some(dp);
 
             // Switch to the correct mode
-            self.sequence.debug_port_setup(self.probe.as_mut(), dp)?;
+            probe_debug_port_wire(self.probe.as_mut(), |wire| {
+                self.sequence.debug_port_setup(wire, dp)
+            })?;
 
-            self.sequence.debug_port_connect(self.probe.as_mut(), dp)?;
+            probe_debug_port_wire(self.probe.as_mut(), |wire| {
+                self.sequence.debug_port_connect(wire, dp)
+            })?;
 
-            self.debug_port_start(dp).unwrap();
+            self.debug_port_start(dp)?;
 
             self.access_ports = valid_access_ports(self, dp).into_iter().collect();
 
@@ -424,8 +436,13 @@ impl SwoAccess for BlackMagicProbeArmDebug {
 }
 
 impl SwdSequence for BlackMagicProbeArmDebug {
-    fn swj_sequence(&mut self, bit_len: u8, bits: u64) -> Result<(), DebugProbeError> {
-        self.probe.swj_sequence(bit_len, bits)
+    fn swj_sequence(&mut self, bits: &BitSequence) -> Result<(), DebugProbeError> {
+        probe_debug_port_wire(self.probe.as_mut(), |wire| wire.swj_sequence(bits)).map_err(
+            |error| match error {
+                ArmError::Probe(error) => error,
+                error => DebugProbeError::Other(error.to_string()),
+            },
+        )
     }
 
     fn swj_pins(
@@ -434,7 +451,23 @@ impl SwdSequence for BlackMagicProbeArmDebug {
         pin_select: u32,
         pin_wait: u32,
     ) -> Result<u32, DebugProbeError> {
-        self.probe.swj_pins(pin_out, pin_select, pin_wait)
+        probe_debug_port_wire(self.probe.as_mut(), |wire| {
+            let levels = wire
+                .swj_pins(
+                    Pins(pin_out as u8),
+                    Pins(pin_select as u8),
+                    Duration::from_micros(pin_wait as u64),
+                )
+                .map_err(|error| match error {
+                    ArmError::Probe(error) => error,
+                    error => DebugProbeError::Other(error.to_string()),
+                })?;
+            Ok(raw_pin_levels(levels))
+        })
+        .map_err(|error| match error {
+            ArmError::Probe(error) => error,
+            error => DebugProbeError::Other(error.to_string()),
+        })
     }
 }
 
@@ -647,14 +680,6 @@ impl DapAccess for BlackMagicProbeArmDebug {
             ))))
         }
     }
-
-    fn try_dap_probe(&self) -> Option<&dyn DapProbe> {
-        Some(&*self.probe)
-    }
-
-    fn try_dap_probe_mut(&mut self) -> Option<&mut dyn DapProbe> {
-        Some(&mut *self.probe)
-    }
 }
 
 impl ArmMemoryInterface for BlackMagicProbeMemoryInterface<'_> {
@@ -679,8 +704,8 @@ impl ArmMemoryInterface for BlackMagicProbeMemoryInterface<'_> {
 }
 
 impl SwdSequence for BlackMagicProbeMemoryInterface<'_> {
-    fn swj_sequence(&mut self, bit_len: u8, bits: u64) -> Result<(), DebugProbeError> {
-        self.probe.swj_sequence(bit_len, bits)
+    fn swj_sequence(&mut self, bits: &BitSequence) -> Result<(), DebugProbeError> {
+        self.probe.swj_sequence(bits)
     }
 
     fn swj_pins(

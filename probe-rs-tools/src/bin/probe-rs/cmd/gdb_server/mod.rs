@@ -1,4 +1,8 @@
-//! GDB server
+//! GDB stub driven by a probe-rs RPC [`SessionInterface`].
+//!
+//! The TCP listener and gdbstub state machine run in the client process. Probe
+//! access goes through RPC, so the same session can be shared with other RPC
+//! clients (for example an RTT UI) without a local `FairMutex<Session>`.
 
 mod arch;
 mod stub;
@@ -8,12 +12,20 @@ pub(crate) use stub::{GdbInstanceConfiguration, run};
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use parking_lot::FairMutex;
-use probe_rs::{config::Registry, probe::list::Lister};
+use probe_rs::CoreRegisters;
+use probe_rs::InstructionSet;
+use probe_rs::config::Registry;
+use probe_rs_rpc::chip::MemoryRegion;
+use probe_rs_rpc::info::WireFlashSector;
+use probe_rs_rpc_client::{RpcClient, SessionInterface};
+use tokio::runtime::Handle;
 
-use crate::util::common_options::ProbeOptions;
+use crate::rpc::functions::core_ops::convert::{from_wire_core_type, from_wire_instruction_set};
+use crate::util::{cli, common_options::ProbeOptions};
 
 #[derive(clap::Parser)]
 pub struct Cmd {
@@ -47,29 +59,49 @@ pub struct Cmd {
 }
 
 impl Cmd {
-    pub fn run(self, registry: &mut Registry, lister: &Lister) -> anyhow::Result<()> {
-        let (mut session, _probe_options) = self.common.simple_attach(registry, lister)?;
+    pub async fn run(self, client: RpcClient) -> anyhow::Result<()> {
+        let mut registry = Registry::from_builtin_families();
+        if let Some(path) = &self.common.chip_description_path
+            && let Ok(yaml) = std::fs::read_to_string(path)
+        {
+            _ = registry.add_target_family_from_yaml(&yaml);
+        }
+
+        let session = cli::attach_probe(&client, self.common, None, false).await?;
 
         if self.reset_halt {
             session
-                .core(0)?
-                .reset_and_halt(Duration::from_millis(100))?;
+                .core(0)
+                .reset_and_halt(Duration::from_millis(500))
+                .await?;
         }
 
         let gdb_connection_string = self
             .gdb_connection_string
             .unwrap_or_else(|| "localhost:1337".to_string());
 
-        let instances = crate::cmd::gdb_server::GdbInstanceConfiguration::from_session(
-            &session,
-            Some(gdb_connection_string),
-        );
+        let context = GdbSessionContext::from_session(&session, &registry).await?;
+        let instances =
+            GdbInstanceConfiguration::from_context(&context, Some(gdb_connection_string))?;
 
         for instance in instances.iter() {
             println!(
                 "Firing up GDB stub for {:?} cores at {:?}",
                 instance.core_type, instance.socket_addrs
             );
+        }
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
+        {
+            let shutdown = shutdown.clone();
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            tokio::spawn(async move {
+                while terminate.recv().await.is_some() {
+                    request_shutdown(&shutdown);
+                }
+            });
         }
 
         let gdb = if let Some(gdb) = self.gdb {
@@ -93,16 +125,97 @@ impl Cmd {
             eprintln!("Spawning {cmd:?}");
             Some(cmd.spawn()?)
         } else {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                while tokio::signal::ctrl_c().await.is_ok() {
+                    request_shutdown(&shutdown);
+                }
+            });
             None
         };
 
-        let session = FairMutex::new(session);
-
-        if let Err(e) = run(&session, instances.iter(), gdb) {
-            eprintln!("During the execution of GDB an error was encountered:");
-            eprintln!("{e:?}");
-        }
+        let handle = Handle::current();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = run(session, handle, context, instances.iter(), gdb, shutdown) {
+                eprintln!("During the execution of GDB an error was encountered:");
+                eprintln!("{e:?}");
+            }
+        })
+        .await?;
 
         Ok(())
     }
+}
+
+/// Cached target facts gathered once after attach.
+pub(crate) struct GdbSessionContext {
+    pub target_name: String,
+    pub cores: Vec<GdbCoreInfo>,
+    /// Memory map from RPC `target/metadata` for GDB memory-map XML.
+    pub memory_map: Vec<MemoryRegion>,
+    /// Absolute flash sectors from RPC `target/metadata`.
+    pub flash_sectors: Vec<WireFlashSector>,
+}
+
+#[derive(Clone)]
+pub(crate) struct GdbCoreInfo {
+    pub index: usize,
+    pub name: String,
+    pub core_type: probe_rs::CoreType,
+    pub registers: &'static CoreRegisters,
+    pub instruction_set: InstructionSet,
+}
+
+impl GdbSessionContext {
+    pub async fn from_session(
+        session: &SessionInterface,
+        registry: &Registry,
+    ) -> anyhow::Result<Self> {
+        let metadata = session.target_metadata().await?;
+        let target = registry.get_target_by_name(&metadata.target_name).ok();
+
+        let mut cores = Vec::with_capacity(metadata.cores.len());
+        for wire_core in &metadata.cores {
+            let core_type = from_wire_core_type(wire_core.core_type);
+            let meta = session.core(wire_core.index as usize).metadata().await?;
+            let registers = CoreRegisters::for_core_type(
+                core_type,
+                meta.fpu_support,
+                meta.floating_point_register_count
+                    .map(|count| count as usize),
+            );
+            let instruction_set = from_wire_instruction_set(meta.instruction_set);
+
+            let name = target
+                .as_ref()
+                .and_then(|t| t.cores.get(wire_core.index as usize))
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| format!("core{}", wire_core.index));
+
+            cores.push(GdbCoreInfo {
+                index: wire_core.index as usize,
+                name,
+                core_type,
+                registers,
+                instruction_set,
+            });
+        }
+
+        Ok(Self {
+            target_name: metadata.target_name,
+            cores,
+            memory_map: metadata.memory_map,
+            flash_sectors: metadata.flash_sectors,
+        })
+    }
+}
+
+/// Asks the server loop to stop. A second request exits immediately, in case the loop is stuck
+/// in a probe operation.
+fn request_shutdown(shutdown: &AtomicBool) {
+    if shutdown.swap(true, Ordering::Relaxed) {
+        eprintln!("Exiting without tearing down the debug session.");
+        std::process::exit(130);
+    }
+    eprintln!("Shutting down the GDB server (repeat to exit immediately).");
 }

@@ -13,15 +13,15 @@ use crate::{
             memory_ap::{MemoryAp, MemoryApType},
             v1::valid_access_ports,
         },
-        communication_interface::{ArmDebugInterface, DapProbe, SwdSequence},
+        communication_interface::{ArmDebugInterface, SwdSequence},
         dp::{DpAddress, DpRegisterAddress},
         memory::ArmMemoryInterface,
         sequences::ArmDebugSequence,
         valid_32bit_arm_address,
     },
     probe::{
-        DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, Probe, ProbeError,
-        ProbeFactory, WireProtocol,
+        BitSequence, DebugProbe, DebugProbeError, DebugProbeSelector, Probe, ProbeError,
+        ProbeFactory, ResetLine, WireProtocol,
     },
 };
 
@@ -62,7 +62,7 @@ impl ProbeFactory for StLinkFactory {
         tracing::debug!("Opening ST-Link: {selector:?}");
         let device = StLinkUsbDevice::new_from_selector(selector)?;
         let mut stlink = StLink {
-            name: format!("ST-Link {}", &device.info.version_name),
+            name: format!("ST-Link {}", device.info.version_name),
             device,
             hw_version: 0,
             jtag_version: 0,
@@ -72,6 +72,7 @@ impl ProbeFactory for StLinkFactory {
             swo_enabled: false,
 
             opened_aps: vec![],
+            reset_line: ResetLine::default(),
         };
 
         stlink.init()?;
@@ -79,7 +80,7 @@ impl ProbeFactory for StLinkFactory {
         Ok(Box::new(stlink))
     }
 
-    fn list_probes(&self) -> Vec<DebugProbeInfo> {
+    fn list_probes(&self) -> Vec<crate::probe::list::ProbeListItem> {
         tools::list_stlink_devices()
     }
 }
@@ -98,6 +99,8 @@ pub struct StLink<D: StLinkUsb> {
 
     /// List of opened APs
     opened_aps: Vec<u8>,
+
+    reset_line: ResetLine,
 }
 
 impl DebugProbe for StLink<StLinkUsbDevice> {
@@ -113,6 +116,12 @@ impl DebugProbe for StLink<StLinkUsbDevice> {
     }
 
     fn set_speed(&mut self, speed_khz: u32) -> Result<u32, DebugProbeError> {
+        // `attach` sets the speed of the other protocol.
+        match self.protocol {
+            WireProtocol::Swd => self.jtag_speed_khz = speed_khz,
+            WireProtocol::Jtag => self.swd_speed_khz = speed_khz,
+        }
+
         match self.hw_version.cmp(&3) {
             Ordering::Less => match self.protocol {
                 WireProtocol::Swd => {
@@ -228,6 +237,7 @@ impl DebugProbe for StLink<StLinkUsbDevice> {
     }
 
     fn target_reset(&mut self) -> Result<(), DebugProbeError> {
+        self.reset_line.check_assert()?;
         let mut buf = [0; 2];
         self.send_jtag_command(
             &[
@@ -244,6 +254,7 @@ impl DebugProbe for StLink<StLinkUsbDevice> {
     }
 
     fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
+        self.reset_line.check_assert()?;
         let mut buf = [0; 2];
         self.send_jtag_command(
             &[
@@ -273,6 +284,10 @@ impl DebugProbe for StLink<StLinkUsbDevice> {
         )?;
 
         Ok(())
+    }
+
+    fn set_reset_line_connected(&mut self, connected: bool) {
+        self.reset_line.set_connected(connected);
     }
 
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {
@@ -1345,7 +1360,7 @@ impl DapAccess for StlinkArmDebug {
 
         tracing::Span::current().record("value", result);
 
-        tracing::debug!("Read succesful");
+        tracing::debug!("Read successful");
 
         Ok(result)
     }
@@ -1400,14 +1415,6 @@ impl DapAccess for StlinkArmDebug {
 
         Ok(())
     }
-
-    fn try_dap_probe(&self) -> Option<&dyn DapProbe> {
-        None
-    }
-
-    fn try_dap_probe_mut(&mut self) -> Option<&mut dyn DapProbe> {
-        None
-    }
 }
 
 impl ArmDebugInterface for StlinkArmDebug {
@@ -1456,7 +1463,7 @@ impl ArmDebugInterface for StlinkArmDebug {
 }
 
 impl SwdSequence for StlinkArmDebug {
-    fn swj_sequence(&mut self, _bit_len: u8, _bits: u64) -> Result<(), DebugProbeError> {
+    fn swj_sequence(&mut self, _bits: &BitSequence) -> Result<(), DebugProbeError> {
         // This is not supported for ST-Links, unfortunately.
         Err(DebugProbeError::CommandNotSupportedByProbe {
             command_name: "swj_sequence",
@@ -1494,8 +1501,8 @@ struct StLinkMemoryInterface<'probe> {
 }
 
 impl SwdSequence for StLinkMemoryInterface<'_> {
-    fn swj_sequence(&mut self, bit_len: u8, bits: u64) -> Result<(), DebugProbeError> {
-        self.probe.swj_sequence(bit_len, bits)
+    fn swj_sequence(&mut self, bits: &BitSequence) -> Result<(), DebugProbeError> {
+        self.probe.swj_sequence(bits)
     }
 
     fn swj_pins(
@@ -1546,7 +1553,7 @@ impl MemoryInterface<ArmError> for StLinkMemoryInterface<'_> {
             return Ok(());
         }
 
-        // Read needs to be chunked into chunks with appropiate max length (see STLINK_MAX_READ_LEN).
+        // Read needs to be chunked into chunks with appropriate max length (see STLINK_MAX_READ_LEN).
         for (index, chunk) in data.chunks_mut(STLINK_MAX_READ_LEN / 4).enumerate() {
             let mut buff = vec![0u8; 4 * chunk.len()];
 
@@ -1556,8 +1563,9 @@ impl MemoryInterface<ArmError> for StLinkMemoryInterface<'_> {
                 self.current_ap.ap_address().ap_v1()?,
             )?;
 
-            for (index, word) in buff.chunks_exact(4).enumerate() {
-                chunk[index] = u32::from_le_bytes(word.try_into().unwrap());
+            let (chunks, _rem) = buff.as_chunks::<4>();
+            for (index, word) in chunks.iter().enumerate() {
+                chunk[index] = u32::from_le_bytes(*word);
             }
         }
 
@@ -1589,8 +1597,9 @@ impl MemoryInterface<ArmError> for StLinkMemoryInterface<'_> {
                 self.current_ap.ap_address().ap_v1()?,
             )?;
 
-            for (index, word) in buff.chunks_exact(2).enumerate() {
-                chunk[index] = u16::from_le_bytes(word.try_into().unwrap());
+            let (chunks, _rem) = buff.as_chunks::<2>();
+            for (index, word) in chunks.iter().enumerate() {
+                chunk[index] = u16::from_le_bytes(*word);
             }
         }
 
@@ -1903,6 +1912,7 @@ mod test {
                 jtag_speed_khz: 0,
                 swo_enabled: false,
                 opened_aps: vec![],
+                reset_line: ResetLine::default(),
             }
         }
     }

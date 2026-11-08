@@ -1,11 +1,10 @@
 use tokio_util::sync::CancellationToken;
 
-use std::ops::ControlFlow;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use probe_rs::{Core, CoreType, Error, HaltReason, VectorCatchCondition};
+use probe_rs::{Core, CoreType, Error, HaltReason, MemoryInterface, VectorCatchCondition};
 
 use crate::rpc::SessionState;
 
@@ -35,15 +34,26 @@ pub enum ReturnReason<R> {
     LockedUp,
 }
 
+/// Default interval between status polls of the primary core when RTT does not request a faster poll.
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Interval between status polls of other cores. Longer than the primary interval to limit probe traffic.
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 impl RunLoop {
-    /// Attaches to RTT and runs the core until it halts.
+    /// Attaches to RTT and runs the primary core until it, or another enabled core, halts.
+    ///
+    /// Vector catch, the initial resume, and the poller run only on [`Self::core_id`]. Other cores
+    /// are observed with `status()` only. A disabled hart is skipped and retried later. An
+    /// unexpected halt, lock-up, or semihosting result on any observed core uses the same predicate
+    /// as the primary core.
     ///
     /// Upon halt the predicate is invoked with the halt reason:
     /// * If the predicate returns `Ok(Some(r))` the run loop returns `Ok(ReturnReason::Predicate(r))`.
-    /// * If the predicate returns `Ok(None)` the run loop will continue running the core.
+    /// * If the predicate returns `Ok(None)` the run loop will continue running the core that halted.
     /// * If the predicate returns `Err(e)` the run loop will return `Err(e)`.
     ///
-    /// The function will also return on timeout with `Ok(ReturnReason::Timeout)` or if the user presses CTRL + C with `Ok(ReturnReason::User)`.
+    /// The function will also return on timeout with `Ok(ReturnReason::Timeout)` or if the user presses CTRL + C with `Ok(ReturnReason::Cancelled)`.
     pub fn run_until<F, R>(
         &mut self,
         shared_session: &SessionState<'_>,
@@ -66,6 +76,7 @@ impl RunLoop {
         {
             let mut session = shared_session.session_blocking();
             let mut core = session.core(self.core_id)?;
+            let memory_port = poller.memory_port(&core);
             let needs_vector_catch = catch_hardfault || catch_reset || catch_svc || catch_hlt;
 
             if needs_vector_catch {
@@ -110,7 +121,14 @@ impl RunLoop {
                 }
             }
 
-            poller.start(&mut core)?;
+            match memory_port {
+                Some(index) => {
+                    drop(core);
+                    poller.start(&mut session.memory_access_port(index)?)?;
+                    core = session.core(self.core_id)?;
+                }
+                None => poller.start(&mut core)?,
+            }
 
             if core.core_halted()? {
                 core.run()?;
@@ -121,9 +139,18 @@ impl RunLoop {
 
         // Clean up run loop
         let mut session = shared_session.session_blocking();
-        let mut core = session.core(self.core_id)?;
         // Always clean up after RTT but don't overwrite the original result.
-        let poller_exit_result = poller.exit(&mut core);
+        let mut core = session.core(self.core_id)?;
+        let poller_exit_result = match poller.memory_port(&core) {
+            Some(index) => {
+                drop(core);
+                session
+                    .memory_access_port(index)
+                    .map_err(Into::into)
+                    .and_then(|mut port| poller.exit(&mut port))
+            }
+            None => poller.exit(&mut core),
+        };
         if result.is_ok() {
             // If the result is Ok, we return the potential error during cleanup.
             poller_exit_result?;
@@ -143,50 +170,127 @@ impl RunLoop {
         F: FnMut(HaltReason, &mut Core) -> Result<Option<R>>,
     {
         let start = Instant::now();
+        let core_count = shared_session.session_blocking().target().cores.len();
+        let mut next_wakeup = vec![start; core_count];
 
         loop {
-            match self.poll_once(shared_session, poller, predicate)? {
-                ControlFlow::Break(reason) => return Ok(reason),
-                ControlFlow::Continue(next_poll) => {
-                    if let Some(timeout) = timeout
-                        && start.elapsed() >= timeout
-                    {
-                        return Ok(ReturnReason::Timeout);
+            let mut next_poll;
+
+            {
+                let mut session = shared_session.session_blocking();
+
+                {
+                    next_poll = DEFAULT_POLL_INTERVAL;
+                    let mut core = session.core(self.core_id)?;
+                    let memory_port = poller.memory_port(&core);
+                    let return_reason = self.check_core(&mut core, &mut next_poll, predicate)?;
+
+                    // Poll RTT after the halt check, so one last poll after a halt flushes
+                    // messages the core printed before halting, such as a panic message.
+                    let poller_result = match memory_port {
+                        Some(index) => {
+                            drop(core);
+                            session
+                                .memory_access_port(index)
+                                .map_err(Into::into)
+                                .and_then(|mut port| poller.poll(&mut port))
+                        }
+                        None => poller.poll(&mut core),
+                    };
+
+                    if let Some(reason) = return_reason {
+                        return reason;
+                    }
+                    next_poll = next_poll.min(poller_result?);
+                }
+
+                if self.cancellation_token.is_cancelled() {
+                    return Ok(ReturnReason::Cancelled);
+                }
+
+                let now = Instant::now();
+                for (idx, wakeup) in next_wakeup.iter_mut().enumerate() {
+                    if idx == self.core_id {
+                        continue;
                     }
 
-                    // If the polling frequency is too high, the USB connection to the probe
-                    // can become unstable. Hence we only poll as little as necessary.
-                    thread::sleep(next_poll);
+                    if now < *wakeup {
+                        next_poll = next_poll.min(wakeup.saturating_duration_since(now));
+                        continue;
+                    }
+
+                    let mut core = match session.core(idx) {
+                        Ok(core) => core,
+                        Err(Error::CoreDisabled(_)) => {
+                            // Retry on the next primary poll so a hart that leaves reset is
+                            // configured before it can panic.
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                "Skipping core {idx} while the run loop observes it: {error}"
+                            );
+                            *wakeup = Instant::now() + WATCH_POLL_INTERVAL;
+                            next_poll = next_poll.min(WATCH_POLL_INTERVAL);
+                            continue;
+                        }
+                    };
+
+                    let mut duration = WATCH_POLL_INTERVAL;
+                    match self
+                        .check_core(&mut core, &mut duration, predicate)
+                        .and_then(Option::transpose)
+                    {
+                        Ok(Some(reason)) => return Ok(reason),
+                        Ok(None) => {
+                            *wakeup = Instant::now() + duration;
+                            next_poll = next_poll.min(duration);
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                "Skipping core {idx} while the run loop observes it: {error}"
+                            );
+                            *wakeup = Instant::now() + WATCH_POLL_INTERVAL;
+                            next_poll = next_poll.min(WATCH_POLL_INTERVAL);
+                        }
+                    }
+
+                    if self.cancellation_token.is_cancelled() {
+                        return Ok(ReturnReason::Cancelled);
+                    }
                 }
             }
+
+            if let Some(timeout) = timeout
+                && start.elapsed() >= timeout
+            {
+                return Ok(ReturnReason::Timeout);
+            }
+
+            // If the polling frequency is too high, the USB connection to the probe
+            // can become unstable. Hence we only poll as little as necessary.
+            thread::sleep(next_poll);
         }
     }
 
-    fn poll_once<F, R>(
+    /// Checks the core for a halt, and runs the predicate on one.
+    fn check_core<F, R>(
         &self,
-        shared_session: &SessionState<'_>,
-        poller: &mut impl RunLoopPoller,
+        core: &mut Core<'_>,
+        next_poll: &mut Duration,
         predicate: &mut F,
-    ) -> Result<ControlFlow<ReturnReason<R>, Duration>>
+    ) -> Result<Option<Result<ReturnReason<R>>>>
     where
         F: FnMut(HaltReason, &mut Core) -> Result<Option<R>>,
     {
-        let mut session = shared_session.session_blocking();
-        let mut core = session.core(self.core_id)?;
-
-        let mut next_poll = Duration::from_millis(100);
-
-        // check for halt first, poll rtt after.
-        // this is important so we do one last poll after halt, so we flush all messages
-        // the core printed before halting, such as a panic message.
-        let return_reason = match core.status()? {
-            probe_rs::CoreStatus::Halted(reason) => match predicate(reason, &mut core) {
+        Ok(match core.status()? {
+            probe_rs::CoreStatus::Halted(reason) => match predicate(reason, core) {
                 Ok(Some(r)) => Some(Ok(ReturnReason::Predicate(r))),
                 Err(e) => Some(Err(e)),
                 Ok(None) => {
                     // Re-poll immediately if the core was halted, to speed up reading strings
                     // from semihosting. The core is not expected to be halted for other reasons.
-                    next_poll = Duration::ZERO;
+                    *next_poll = Duration::ZERO;
                     core.run()?;
                     None
                 }
@@ -199,43 +303,34 @@ impl RunLoop {
             }
 
             probe_rs::CoreStatus::LockedUp => Some(Ok(ReturnReason::LockedUp)),
-        };
-
-        let poller_result = poller.poll(&mut core);
-
-        if let Some(reason) = return_reason {
-            return reason.map(ControlFlow::Break);
-        }
-        if self.cancellation_token.is_cancelled() {
-            return Ok(ControlFlow::Break(ReturnReason::Cancelled));
-        }
-        match poller_result {
-            Ok(delay) => next_poll = next_poll.min(delay),
-            Err(error) => return Err(error),
-        }
-
-        Ok(ControlFlow::Continue(next_poll))
+        })
     }
 }
 
 pub trait RunLoopPoller {
-    fn start(&mut self, core: &mut Core<'_>) -> Result<()>;
-    fn poll(&mut self, core: &mut Core<'_>) -> Result<Duration>;
-    fn exit(&mut self, core: &mut Core<'_>) -> Result<()>;
+    fn start(&mut self, core: &mut impl MemoryInterface) -> Result<()>;
+
+    /// Returns the memory port to poll through instead of the core.
+    fn memory_port(&mut self, _core: &Core) -> Option<usize> {
+        None
+    }
+
+    fn poll(&mut self, core: &mut impl MemoryInterface) -> Result<Duration>;
+    fn exit(&mut self, core: &mut impl MemoryInterface) -> Result<()>;
 }
 
 pub struct NoopPoller;
 
 impl RunLoopPoller for NoopPoller {
-    fn start(&mut self, _core: &mut Core<'_>) -> Result<()> {
+    fn start(&mut self, _core: &mut impl MemoryInterface) -> Result<()> {
         Ok(())
     }
 
-    fn poll(&mut self, _core: &mut Core<'_>) -> Result<Duration> {
+    fn poll(&mut self, _core: &mut impl MemoryInterface) -> Result<Duration> {
         Ok(Duration::from_secs(u64::MAX))
     }
 
-    fn exit(&mut self, _core: &mut Core<'_>) -> Result<()> {
+    fn exit(&mut self, _core: &mut impl MemoryInterface) -> Result<()> {
         Ok(())
     }
 }
@@ -244,7 +339,7 @@ impl<T> RunLoopPoller for Option<T>
 where
     T: RunLoopPoller,
 {
-    fn start(&mut self, core: &mut Core<'_>) -> Result<()> {
+    fn start(&mut self, core: &mut impl MemoryInterface) -> Result<()> {
         if let Some(poller) = self {
             poller.start(core)
         } else {
@@ -252,7 +347,11 @@ where
         }
     }
 
-    fn poll(&mut self, core: &mut Core<'_>) -> Result<Duration> {
+    fn memory_port(&mut self, core: &Core) -> Option<usize> {
+        self.as_mut()?.memory_port(core)
+    }
+
+    fn poll(&mut self, core: &mut impl MemoryInterface) -> Result<Duration> {
         if let Some(poller) = self {
             poller.poll(core)
         } else {
@@ -260,7 +359,7 @@ where
         }
     }
 
-    fn exit(&mut self, core: &mut Core<'_>) -> Result<()> {
+    fn exit(&mut self, core: &mut impl MemoryInterface) -> Result<()> {
         if let Some(poller) = self {
             poller.exit(core)
         } else {

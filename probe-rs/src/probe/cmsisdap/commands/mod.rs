@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub(crate) mod fake;
 pub mod general;
 pub mod jtag;
 pub mod swd;
@@ -5,17 +7,33 @@ pub mod swj;
 pub mod swo;
 pub mod transfer;
 
-use crate::probe::cmsisdap::commands::general::info::PacketSizeCommand;
-use crate::probe::usb_util::InterfaceExt;
+use crate::probe::cmsisdap::commands::general::info::{PacketCountCommand, PacketSizeCommand};
+use crate::probe::cmsisdap::tcp::TcpDevice;
+use crate::probe::usb_util::{BulkReadExt, BulkWriteExt};
 use crate::probe::{ProbeError, WireProtocol};
+use nusb::{
+    Endpoint,
+    transfer::{Bulk, In, Out},
+};
 use std::io::ErrorKind;
 use std::str::Utf8Error;
 use std::time::Duration;
 
 use self::general::host_status::HostStatusRequest;
 use self::swj::clock::SWJClockRequest;
+use self::transfer::TransferAbortRequest;
 
 pub(crate) const DEFAULT_USB_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Rounds spent bringing replies back into step before giving up on the probe.
+const MAX_RESYNC_ROUNDS: usize = 32;
+
+/// How long to wait for a reply the probe was prompted to give up.
+const RESYNC_IDLE: Duration = Duration::from_millis(5);
+
+/// The USB timeout while resynchronising. A probe on a local USB link answers within it. A slower
+/// one shows itself in a silent round, and gets the full USB timeout from then on.
+const RESYNC_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Debug, thiserror::Error, docsplay::Display)]
 pub enum CmsisDapError {
@@ -45,6 +63,9 @@ pub enum CmsisDapError {
 
     /// Could not determine a suitable packet size for this probe.
     NoPacketSize,
+
+    /// Could not connect to the probe over TCP.
+    TcpConnect(#[source] std::io::Error),
 
     /// Invalid IDCODE detected.
     InvalidIdCode,
@@ -122,6 +143,11 @@ pub enum RequestError {
         request: transfer::configure::ConfigureRequest,
     },
 
+    /// Failed to write the ABORT register with the following request: {request:?}
+    WriteAbort {
+        request: transfer::write_abort::WriteAbortRequest,
+    },
+
     /// Failed to send the SWD sequence to the probe with the following request: {request:?}
     SwjSequence {
         request: swj::sequence::SequenceRequest,
@@ -168,16 +194,33 @@ pub enum CmsisDapDevice {
     },
 
     /// CMSIS-DAP v2 over WinUSB/Bulk.
-    /// Stores an usb device handle, out/in EP addresses, maximum DAP packet size,
-    /// and an optional SWO streaming EP address and SWO maximum packet size.
+    /// Stores the usb interface handle, persistent bulk out/in endpoints, the
+    /// maximum DAP packet size, and an optional persistent SWO streaming
+    /// endpoint.
+    ///
+    /// The endpoints are claimed once when the device is opened and reused for
+    /// every transfer, rather than being re-claimed per transfer. This both
+    /// removes per-transfer setup/teardown cost and provides a stable place to
+    /// keep multiple transfers in flight (see FAST_USB.md).
     V2 {
         handle: nusb::Interface,
-        out_ep: u8,
-        in_ep: u8,
+        out_ep: Endpoint<Bulk, Out>,
+        in_ep: Endpoint<Bulk, In>,
         max_packet_size: usize,
-        swo_ep: Option<(u8, usize)>,
+        swo_ep: Option<Endpoint<Bulk, In>>,
         usb_timeout: Duration,
     },
+
+    /// CMSIS-DAP over TCP, with the framing of OpenOCD's TCP backend.
+    Tcp {
+        device: TcpDevice,
+        max_packet_size: usize,
+        timeout: Duration,
+    },
+
+    /// A scripted probe for host tests.
+    #[cfg(test)]
+    Fake(std::sync::Arc<std::sync::Mutex<fake::FakeProbe>>),
 }
 
 impl CmsisDapDevice {
@@ -186,6 +229,9 @@ impl CmsisDapDevice {
             #[cfg(feature = "cmsisdap_v1")]
             Self::V1 { usb_timeout, .. } => *usb_timeout,
             Self::V2 { usb_timeout, .. } => *usb_timeout,
+            Self::Tcp { timeout, .. } => *timeout,
+            #[cfg(test)]
+            Self::Fake(probe) => probe.lock().unwrap().usb_timeout,
         }
     }
 
@@ -194,34 +240,61 @@ impl CmsisDapDevice {
             #[cfg(feature = "cmsisdap_v1")]
             Self::V1 { usb_timeout, .. } => *usb_timeout = timeout,
             Self::V2 { usb_timeout, .. } => *usb_timeout = timeout,
+            Self::Tcp { timeout: t, .. } => *t = timeout,
+            #[cfg(test)]
+            Self::Fake(probe) => probe.lock().unwrap().usb_timeout = timeout,
         }
     }
 
     /// Read from the probe into `buf`, returning the number of bytes read on success.
-    fn read(&self, buf: &mut [u8]) -> Result<usize, SendError> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, SendError> {
         match self {
             #[cfg(feature = "cmsisdap_v1")]
-            CmsisDapDevice::V1 { handle, .. } => {
-                match handle.read_timeout(buf, self.usb_timeout().as_millis() as i32)? {
+            CmsisDapDevice::V1 {
+                handle,
+                usb_timeout,
+                ..
+            } => {
+                match handle.read_timeout(buf, usb_timeout.as_millis() as i32)? {
                     // Timeout is not indicated by error, but by returning 0 read bytes
                     0 => Err(SendError::Timeout),
                     n => Ok(n),
                 }
             }
-            CmsisDapDevice::V2 { handle, in_ep, .. } => {
-                Ok(handle.read_bulk(*in_ep, buf, self.usb_timeout())?)
+            CmsisDapDevice::V2 {
+                in_ep, usb_timeout, ..
+            } => Ok(in_ep.read_bulk(buf, *usb_timeout)?),
+            CmsisDapDevice::Tcp {
+                device, timeout, ..
+            } => Ok(device.read(buf, *timeout)?),
+            #[cfg(test)]
+            CmsisDapDevice::Fake(probe) => {
+                let reply = probe.lock().unwrap().read().ok_or(SendError::Timeout)?;
+                buf[..reply.len()].copy_from_slice(&reply);
+                Ok(reply.len())
             }
         }
     }
 
     /// Write `buf` to the probe, returning the number of bytes written on success.
-    fn write(&self, buf: &[u8]) -> Result<usize, SendError> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
         match self {
             #[cfg(feature = "cmsisdap_v1")]
             CmsisDapDevice::V1 { handle, .. } => Ok(handle.write(buf)?),
-            CmsisDapDevice::V2 { handle, out_ep, .. } => {
+            CmsisDapDevice::V2 {
+                out_ep,
+                usb_timeout,
+                ..
+            } => {
                 // Skip first byte as it's set to 0 for HID transfers
-                Ok(handle.write_bulk(*out_ep, &buf[1..], self.usb_timeout())?)
+                Ok(out_ep.write_bulk(&buf[1..], *usb_timeout)?)
+            }
+            // Skip the HID report byte, as for v2.
+            CmsisDapDevice::Tcp { device, .. } => Ok(device.write(&buf[1..])?),
+            #[cfg(test)]
+            CmsisDapDevice::Fake(probe) => {
+                probe.lock().unwrap().write(&buf[1..]);
+                Ok(buf.len() - 1)
             }
         }
     }
@@ -229,9 +302,22 @@ impl CmsisDapDevice {
     /// Drain any pending data from the probe, ensuring future responses are
     /// synchronised to requests. Swallows any errors, which are expected if
     /// there is no pending data to read.
-    pub(super) fn drain(&self) {
+    pub(super) fn drain(&mut self) {
+        self.drain_idle_for(Duration::from_millis(1));
+    }
+
+    /// Drain as [`CmsisDapDevice::drain`], treating the queue as empty only once the probe has
+    /// produced nothing for `idle`.
+    ///
+    /// A probe working through a backlog hands its replies over one at a time and not always
+    /// promptly, so the short window that suffices for an ordinary open sees an empty pipe and
+    /// leaves the rest of the backlog in place.
+    ///
+    /// Returns whether anything was read.
+    pub(super) fn drain_idle_for(&mut self, idle: Duration) -> bool {
         tracing::debug!("Draining probe of any pending data.");
 
+        let mut drained = false;
         match self {
             #[cfg(feature = "cmsisdap_v1")]
             CmsisDapDevice::V1 {
@@ -239,29 +325,43 @@ impl CmsisDapDevice {
                 report_size,
                 ..
             } => loop {
-                let mut discard = vec![0u8; report_size + 1];
-                match handle.read_timeout(&mut discard, 1) {
-                    Ok(n) if n != 0 => continue,
+                let mut discard = vec![0u8; *report_size + 1];
+                match handle.read_timeout(&mut discard, idle.as_millis().max(1) as i32) {
+                    Ok(n) if n != 0 => drained = true,
                     _ => break,
                 }
             },
 
             CmsisDapDevice::V2 {
-                handle,
                 in_ep,
                 max_packet_size,
                 ..
             } => {
-                let timeout = Duration::from_millis(1);
+                let timeout = idle;
                 let mut discard = vec![0u8; *max_packet_size];
                 loop {
-                    match handle.read_bulk(*in_ep, &mut discard, timeout) {
-                        Ok(n) if n != 0 => continue,
+                    match in_ep.read_bulk(&mut discard, timeout) {
+                        Ok(n) if n != 0 => drained = true,
                         _ => break,
                     }
                 }
             }
+
+            CmsisDapDevice::Tcp {
+                device,
+                max_packet_size,
+                ..
+            } => {
+                let mut discard = vec![0u8; *max_packet_size];
+                while device.read(&mut discard, idle).is_ok() {
+                    drained = true;
+                }
+            }
+
+            #[cfg(test)]
+            CmsisDapDevice::Fake(probe) => drained = probe.lock().unwrap().drain(),
         }
+        drained
     }
 
     /// Set the packet size to use for this device.
@@ -277,9 +377,14 @@ impl CmsisDapDevice {
             }
             CmsisDapDevice::V2 {
                 max_packet_size, ..
+            }
+            | CmsisDapDevice::Tcp {
+                max_packet_size, ..
             } => {
                 *max_packet_size = packet_size;
             }
+            #[cfg(test)]
+            CmsisDapDevice::Fake(probe) => probe.lock().unwrap().max_packet_size = packet_size,
         }
     }
 
@@ -292,13 +397,13 @@ impl CmsisDapDevice {
     ///
     /// The device is then configured to use the detected size, which is returned.
     pub(super) fn find_packet_size(&mut self) -> Result<usize, CmsisDapError> {
+        // Use a short USB timeout when determining packet size as otherwise we wait
+        // several seconds each time for enough data to accumulate.
+        let old_timeout = self.usb_timeout();
+        self.set_usb_timeout(Duration::from_millis(50));
         for repeat in 0..16 {
             tracing::debug!("Attempt {} to find packet size", repeat + 1);
-            // Use a short USB timeout when determining packet size as otherwise we wait
-            // several seconds each time for enough data to accumulate.
-            let old_timeout = self.usb_timeout();
-            self.set_usb_timeout(Duration::from_millis(50));
-            match send_command(self, &PacketSizeCommand {}) {
+            match send_command_once(self, &PacketSizeCommand {}) {
                 Ok(size) => {
                     tracing::debug!("Success: packet size is {}", size);
                     self.set_usb_timeout(old_timeout);
@@ -312,6 +417,13 @@ impl CmsisDapDevice {
                     ..
                 }) => (),
 
+                // A reply to a command from before this device was opened. It has now been read
+                // and the rest of the queue discarded with it, so the next attempt gets its own.
+                Err(CmsisDapError::Send {
+                    source: SendError::CommandIdMismatch(..),
+                    ..
+                }) => (),
+
                 // Raise other errors.
                 Err(e) => return Err(e),
             }
@@ -321,12 +433,87 @@ impl CmsisDapDevice {
         Err(CmsisDapError::NoPacketSize)
     }
 
+    /// Bring requests and replies back into step.
+    ///
+    /// A probe interrupted mid-transfer answers the next command with the previous one's reply,
+    /// and goes on doing so across a close and reopen. Draining does not clear it: nothing is
+    /// waiting on the endpoint, so a drain reads nothing and the next command is answered late all
+    /// the same. Ordinary commands do not clear it either, however many are sent.
+    ///
+    /// What does clear it, measured a reply at a time, is `DAP_TransferAbort`, which the probe
+    /// answers with nothing at all. Some firmware, debugprobe among it, runs the abort in order
+    /// behind the stalled transfer instead, and answers it with `0xFF`.
+    ///
+    /// Whether the stream is level has to be asked with two different commands. A repeated one
+    /// cannot tell its own reply from the previous copy's. The two are the `DAP_Info` packet count
+    /// and packet size: they share a command ID, but their replies differ in length, so neither
+    /// passes for the other, and neither passes for the abort's `0xFF`. The order alternates
+    /// between rounds, so that late replies to the previous round's pair cannot pass.
+    pub(super) fn resynchronise(&mut self) {
+        let usb_timeout = self.usb_timeout();
+        self.set_usb_timeout(RESYNC_TIMEOUT);
+        let in_step = self.resynchronise_rounds(usb_timeout);
+        self.set_usb_timeout(usb_timeout);
+
+        if !in_step {
+            tracing::warn!("Could not bring the probe's replies back into step with its requests.");
+        }
+    }
+
+    fn resynchronise_rounds(&mut self, patience: Duration) -> bool {
+        for round in 0..MAX_RESYNC_ROUNDS {
+            // Unconditionally, and before asking anything: a probe that owes a reply does not give
+            // it up for a command that queues another one behind it, so the question cannot be
+            // asked until this has been done at least once.
+            let _ = send_request(self, &TransferAbortRequest);
+            let drained = self.drain_idle_for(RESYNC_IDLE);
+
+            let mut checks = [Self::check_packet_count, Self::check_packet_size];
+            if round % 2 == 1 {
+                checks.reverse();
+            }
+            let results = checks.map(|check| check(self));
+
+            if results.iter().all(Result::is_ok) {
+                if round > 0 {
+                    tracing::debug!("Probe back in step after {round} rounds");
+                }
+                return true;
+            }
+
+            // A probe that runs a long transfer is silent for a while. One that stays silent, or
+            // is unplugged, does not come back by asking it again.
+            let replied = results.iter().any(|result| {
+                result.as_ref().is_ok() || result.as_ref().is_err_and(reply_is_not_ours)
+            });
+            if !drained && !replied {
+                if !self.drain_idle_for(patience) {
+                    break;
+                }
+                self.set_usb_timeout(patience);
+            }
+        }
+
+        false
+    }
+
+    fn check_packet_count(&mut self) -> Result<(), CmsisDapError> {
+        send_command_once(self, &PacketCountCommand {}).map(drop)
+    }
+
+    fn check_packet_size(&mut self) -> Result<(), CmsisDapError> {
+        send_command_once(self, &PacketSizeCommand {}).map(drop)
+    }
+
     /// Check if SWO streaming is supported by this device.
     pub(super) fn swo_streaming_supported(&self) -> bool {
         match self {
             #[cfg(feature = "cmsisdap_v1")]
             CmsisDapDevice::V1 { .. } => false,
             CmsisDapDevice::V2 { swo_ep, .. } => swo_ep.is_some(),
+            CmsisDapDevice::Tcp { .. } => false,
+            #[cfg(test)]
+            CmsisDapDevice::Fake(_) => false,
         }
     }
 
@@ -335,20 +522,20 @@ impl CmsisDapDevice {
     /// Returns SWOModeNotAvailable if this device does not support SWO streaming.
     ///
     /// On timeout, returns a zero-length buffer.
-    pub(super) fn read_swo_stream(&self, timeout: Duration) -> Result<Vec<u8>, CmsisDapError> {
+    pub(super) fn read_swo_stream(&mut self, timeout: Duration) -> Result<Vec<u8>, CmsisDapError> {
         match self {
             #[cfg(feature = "cmsisdap_v1")]
             CmsisDapDevice::V1 { .. } => Err(CmsisDapError::SwoModeNotAvailable),
-            CmsisDapDevice::V2 { handle, swo_ep, .. } => match swo_ep {
-                Some((ep, len)) => {
-                    let mut buf = vec![0u8; *len];
-                    match handle.read_bulk(*ep, &mut buf, timeout) {
+            CmsisDapDevice::V2 { swo_ep, .. } => match swo_ep {
+                Some(ep) => {
+                    let mut buf = vec![0u8; ep.max_packet_size()];
+                    match ep.read_bulk(&mut buf, timeout) {
                         Ok(n) => {
                             buf.truncate(n);
                             Ok(buf)
                         }
                         Err(e) if e.kind() == ErrorKind::TimedOut => {
-                            buf.truncate(0);
+                            buf.clear();
                             Ok(buf)
                         }
                         Err(e) => Err(CmsisDapError::SwoReadError(e)),
@@ -356,6 +543,9 @@ impl CmsisDapDevice {
                 }
                 None => Err(CmsisDapError::SwoModeNotAvailable),
             },
+            CmsisDapDevice::Tcp { .. } => Err(CmsisDapError::SwoModeNotAvailable),
+            #[cfg(test)]
+            CmsisDapDevice::Fake(_) => Err(CmsisDapError::SwoModeNotAvailable),
         }
     }
 }
@@ -431,7 +621,23 @@ pub(crate) trait Request {
     fn parse_response(&self, buffer: &[u8]) -> Result<Self::Response, SendError>;
 }
 
+/// Send a request and take its reply. After a failure that can leave a reply behind, bring the
+/// replies back into step, so that the next command reads its own.
 pub(crate) fn send_command<Req: Request>(
+    device: &mut CmsisDapDevice,
+    request: &Req,
+) -> Result<Req::Response, CmsisDapError> {
+    let response = send_command_once(device, request);
+    if let Err(error) = &response
+        && may_be_out_of_step(error)
+    {
+        device.resynchronise();
+    }
+    response
+}
+
+/// Send a request and take its reply, without the recovery of [`send_command`].
+pub(crate) fn send_command_once<Req: Request>(
     device: &mut CmsisDapDevice,
     request: &Req,
 ) -> Result<Req::Response, CmsisDapError> {
@@ -441,23 +647,106 @@ pub(crate) fn send_command<Req: Request>(
     })
 }
 
-fn send_command_inner<Req: Request>(
+/// Whether the probe can still owe a reply after this error, or has already answered an earlier
+/// command in place of this one.
+///
+/// A late reply arrives after the 1 ms drain that follows the error, so the drain alone does not
+/// take it off the device.
+pub(crate) fn may_be_out_of_step(error: &CmsisDapError) -> bool {
+    match error {
+        CmsisDapError::Send { source, .. } => match source {
+            SendError::Timeout | SendError::NotEnoughData | SendError::UnexpectedAnswer => true,
+            SendError::CommandIdMismatch(id, _) => *id != 0xFF,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether an error says the probe answered with something that was not a reply to what was asked.
+///
+/// A timeout or a USB failure says the probe is gone or silent, which asking again does not fix.
+/// These say a reply arrived and made no sense as an answer to the question, which is what a
+/// backlog from an earlier session looks like.
+pub(crate) fn reply_is_not_ours(error: &CmsisDapError) -> bool {
+    matches!(
+        error,
+        CmsisDapError::Send {
+            source: SendError::CommandIdMismatch(..)
+                | SendError::UnexpectedAnswer
+                | SendError::NotEnoughData,
+            ..
+        }
+    )
+}
+
+/// Treats the `0xFF` reply of a probe that does not implement a command as success.
+///
+/// That reply still answers this command and not an earlier one, so the stream is in step.
+pub(crate) fn ignore_unknown_command<T>(
+    result: Result<T, CmsisDapError>,
+) -> Result<(), CmsisDapError> {
+    match result {
+        Ok(_)
+        | Err(CmsisDapError::Send {
+            source: SendError::CommandIdMismatch(0xFF, _),
+            ..
+        }) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Send a request without waiting for its reply.
+///
+/// The probe owes a reply for every request it accepts, and they come back in order. A caller
+/// that sends more than one before reading must take the same number of replies, in the same
+/// order, or the next command reads someone else's answer.
+pub(crate) fn send_request<Req: Request>(
     device: &mut CmsisDapDevice,
     request: &Req,
-) -> Result<Req::Response, SendError> {
-    // Size the buffer for the maximum packet size.
-    // On v1, we always send this full-sized report, while
-    // on v2 we can truncate to just the required data.
-    // Add one byte for HID report ID.
-    let buffer_len: usize = match device {
+) -> Result<(), CmsisDapError> {
+    let mut buffer = vec![0; packet_buffer_len(device)];
+    send_request_inner(device, request, &mut buffer).map_err(|e| CmsisDapError::Send {
+        command_id: Req::COMMAND_ID,
+        source: e,
+    })
+}
+
+/// Take the reply to a request already sent by [`send_request`].
+pub(crate) fn receive_response<Req: Request>(
+    device: &mut CmsisDapDevice,
+    request: &Req,
+) -> Result<Req::Response, CmsisDapError> {
+    let mut buffer = vec![0; packet_buffer_len(device)];
+    receive_response_inner(device, request, &mut buffer).map_err(|e| CmsisDapError::Send {
+        command_id: Req::COMMAND_ID,
+        source: e,
+    })
+}
+
+/// Size a buffer for the largest packet the device can carry, plus the HID report id.
+fn packet_buffer_len(device: &CmsisDapDevice) -> usize {
+    match device {
         #[cfg(feature = "cmsisdap_v1")]
         CmsisDapDevice::V1 { report_size, .. } => *report_size + 1,
         CmsisDapDevice::V2 {
             max_packet_size, ..
+        }
+        | CmsisDapDevice::Tcp {
+            max_packet_size, ..
         } => *max_packet_size + 1,
-    };
-    let mut buffer = vec![0; buffer_len];
+        #[cfg(test)]
+        CmsisDapDevice::Fake(probe) => probe.lock().unwrap().max_packet_size + 1,
+    }
+}
 
+/// `buffer` must be zeroed past the request. A v1 device is sent a whole report, so whatever is
+/// left in the tail goes on the wire.
+fn send_request_inner<Req: Request>(
+    device: &mut CmsisDapDevice,
+    request: &Req,
+    buffer: &mut [u8],
+) -> Result<(), SendError> {
     // Leave byte 0 as the HID report, and write the command and request to the buffer.
     buffer[1] = Req::COMMAND_ID as u8;
     #[cfg_attr(not(feature = "cmsisdap_v1"), allow(unused_mut))]
@@ -472,12 +761,18 @@ fn send_command_inner<Req: Request>(
         size = *report_size + 1;
     }
 
-    // Send buffer to the device.
     let _ = device.write(&buffer[..size])?;
     trace_buffer("Transmit buffer", &buffer[..size]);
 
-    // Read back response.
-    let bytes_read = device.read(&mut buffer)?;
+    Ok(())
+}
+
+fn receive_response_inner<Req: Request>(
+    device: &mut CmsisDapDevice,
+    request: &Req,
+    buffer: &mut [u8],
+) -> Result<Req::Response, SendError> {
+    let bytes_read = device.read(buffer)?;
     let response_data = &buffer[..bytes_read];
     trace_buffer("Receive buffer", response_data);
 
@@ -493,6 +788,26 @@ fn send_command_inner<Req: Request>(
             Req::COMMAND_ID,
         ))
     }
+}
+
+fn send_command_inner<Req: Request>(
+    device: &mut CmsisDapDevice,
+    request: &Req,
+) -> Result<Req::Response, SendError> {
+    let mut buffer = vec![0; packet_buffer_len(device)];
+
+    send_request_inner(device, request, &mut buffer)?;
+
+    // Once the request is out the probe owes a reply, so a failure here has to take it off the
+    // device before returning. Left there, the next command reads this reply instead of its own
+    // and rejects it as the wrong command, and so does every command after that for as long as
+    // the device stays open.
+    let response = receive_response_inner(device, request, &mut buffer);
+    if response.is_err() {
+        device.drain();
+    }
+
+    response
 }
 
 /// Trace log a buffer, including only the first trailing zero.

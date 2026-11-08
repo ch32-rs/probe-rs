@@ -6,7 +6,7 @@ use probe_rs::{
 };
 use serde::Serialize;
 
-/// Stores the relevant information from [`crate::core::CoreRegister`] for use in debug operations,
+/// Stores the relevant information from [`probe_rs::CoreRegister`] for use in debug operations,
 /// as well as additional information required during debug.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DebugRegister {
@@ -82,7 +82,7 @@ impl DebugRegister {
 pub struct DebugRegisters(pub Vec<DebugRegister>);
 
 impl DebugRegisters {
-    /// Read all registers defined in [`probe_rs::core::CoreRegisters`] from the given core.
+    /// Read all registers defined in [`probe_rs::CoreRegisters`] from the given core.
     pub fn from_core(core: &mut impl CoreInterface) -> Self {
         if let Err(error) = core.spill_registers() {
             tracing::warn!("Failed to spill registers: {error}");
@@ -110,23 +110,18 @@ impl DebugRegisters {
         })
     }
 
-    fn from_core_registers(
+    pub fn from_core_registers(
         regs: &'static CoreRegisters,
         mut reg_value: impl FnMut(&RegisterId) -> Option<RegisterValue>,
     ) -> Self {
         let mut debug_registers = Vec::<DebugRegister>::new();
-        for (dwarf_id, core_register) in regs.core_registers().enumerate() {
+        for core_register in regs.core_registers() {
             // Check to ensure the register type is compatible with u64.
             if matches!(core_register.data_type(), RegisterDataType::UnsignedInteger(size_in_bits) if size_in_bits <= 64)
             {
                 debug_registers.push(DebugRegister {
                     core_register,
-                    // The DWARF register ID is only valid for the first 32 registers.
-                    dwarf_id: if dwarf_id < 32 {
-                        Some(dwarf_id as u16)
-                    } else {
-                        None
-                    },
+                    dwarf_id: core_register.dwarf_id(),
                     value: reg_value(&core_register.id()),
                 });
             } else {
@@ -144,6 +139,17 @@ impl DebugRegisters {
         self.get_program_counter()
             .map(|debug_register| debug_register.core_register.size_in_bits().div_ceil(8))
             .unwrap_or(0)
+    }
+
+    /// Wraps a program address in a [`RegisterValue`] of the target's address size, so that its
+    /// printed width is consistent across all stack frames. A plain `RegisterValue::from(u64)`
+    /// would always yield a `U64`, printing 16 hex digits on 32-bit targets.
+    pub fn address_to_register_value(&self, address: u64) -> RegisterValue {
+        match self.get_address_size_bytes() {
+            4 => RegisterValue::U32(address as u32),
+            8 => RegisterValue::U64(address),
+            _ => RegisterValue::from(address),
+        }
     }
 
     /// Get the canonical frame address, as specified in the [DWARF](https://dwarfstd.org) specification, section 6.4.

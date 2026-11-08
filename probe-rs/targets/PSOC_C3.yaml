@@ -1,3 +1,7 @@
+#
+# SPDX-FileCopyrightText: Copyright probe-rs Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
 name: PSC3
 manufacturer:
   id: 0x41
@@ -59,8 +63,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -77,6 +82,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -85,8 +91,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -96,6 +113,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -104,6 +122,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3M3EDACQ1
   cores:
   - name: cortex-m33
@@ -120,8 +140,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -138,6 +159,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -146,8 +168,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -157,6 +190,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -165,6 +199,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3M3EDLGQ1
   cores:
   - name: cortex-m33
@@ -181,8 +217,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -199,6 +236,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -207,8 +245,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -218,6 +267,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -226,6 +276,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3M3EDLHQ1
   cores:
   - name: cortex-m33
@@ -242,8 +294,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -260,6 +313,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -268,8 +322,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -279,6 +344,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -287,6 +353,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3M3FDS2ABQ1
   cores:
   - name: cortex-m33
@@ -303,8 +371,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -321,6 +390,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -329,8 +399,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -340,6 +421,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -348,6 +430,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3M3FDS2ACQ1
   cores:
   - name: cortex-m33
@@ -364,8 +448,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -382,6 +467,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -390,8 +476,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -401,6 +498,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -409,6 +507,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3M3FDS2LGQ1
   cores:
   - name: cortex-m33
@@ -425,8 +525,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -443,6 +544,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -451,8 +553,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -462,6 +575,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -470,6 +584,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3M3FDS2LHQ1
   cores:
   - name: cortex-m33
@@ -486,8 +602,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -504,6 +621,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -512,8 +630,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -523,6 +652,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -531,6 +661,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3M5EDABQ1
   cores:
   - name: cortex-m33
@@ -547,8 +679,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -565,6 +698,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -573,8 +707,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -584,6 +729,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -592,6 +738,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3M5EDACQ1
   cores:
   - name: cortex-m33
@@ -608,8 +756,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -626,6 +775,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -634,8 +784,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -645,6 +806,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -653,6 +815,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3M5EDAFQ1
   cores:
   - name: cortex-m33
@@ -669,8 +833,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -687,6 +852,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -695,8 +861,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -706,6 +883,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -714,6 +892,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3M5EDLGQ1
   cores:
   - name: cortex-m33
@@ -730,8 +910,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -748,6 +929,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -756,8 +938,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -767,6 +960,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -775,6 +969,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3M5EDLHQ1
   cores:
   - name: cortex-m33
@@ -791,8 +987,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -809,6 +1006,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -817,8 +1015,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -828,6 +1037,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -836,6 +1046,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3M5FDS2ABQ1
   cores:
   - name: cortex-m33
@@ -852,8 +1064,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -870,6 +1083,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -878,8 +1092,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -889,6 +1114,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -897,6 +1123,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3M5FDS2ACQ1
   cores:
   - name: cortex-m33
@@ -913,8 +1141,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -931,6 +1160,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -939,8 +1169,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -950,6 +1191,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -958,6 +1200,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3M5FDS2AFQ1
   cores:
   - name: cortex-m33
@@ -974,8 +1218,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -992,6 +1237,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -1000,8 +1246,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -1011,6 +1268,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1019,6 +1277,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3M5FDS2LGQ1
   cores:
   - name: cortex-m33
@@ -1035,8 +1295,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -1053,6 +1314,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -1061,8 +1323,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -1072,6 +1345,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1080,6 +1354,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3M5FDS2LHQ1
   cores:
   - name: cortex-m33
@@ -1096,8 +1372,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -1114,6 +1391,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -1122,8 +1400,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -1133,6 +1422,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1141,6 +1431,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3P2EDABQ1
   cores:
   - name: cortex-m33
@@ -1157,8 +1449,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -1175,6 +1468,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -1183,8 +1477,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -1194,6 +1499,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1202,6 +1508,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3P2EDACQ1
   cores:
   - name: cortex-m33
@@ -1218,8 +1526,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -1236,6 +1545,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -1244,8 +1554,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -1255,6 +1576,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1263,6 +1585,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3P2EDLGQ1
   cores:
   - name: cortex-m33
@@ -1279,8 +1603,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -1297,6 +1622,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -1305,8 +1631,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -1316,6 +1653,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1324,6 +1662,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3P2EDLHQ1
   cores:
   - name: cortex-m33
@@ -1340,8 +1680,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -1358,6 +1699,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -1366,8 +1708,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -1377,6 +1730,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1385,6 +1739,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3P2FDS2ABQ1
   cores:
   - name: cortex-m33
@@ -1401,8 +1757,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -1419,6 +1776,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -1427,8 +1785,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -1438,6 +1807,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1446,6 +1816,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3P2FDS2ACQ1
   cores:
   - name: cortex-m33
@@ -1462,8 +1834,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -1480,6 +1853,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -1488,8 +1862,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -1499,6 +1884,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1507,6 +1893,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3P2FDS2LGQ1
   cores:
   - name: cortex-m33
@@ -1523,8 +1911,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -1541,6 +1930,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -1549,8 +1939,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -1560,6 +1961,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1568,6 +1970,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3P2FDS2LHQ1
   cores:
   - name: cortex-m33
@@ -1584,8 +1988,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -1602,6 +2007,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -1610,8 +2016,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -1621,6 +2038,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1629,6 +2047,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3P5EDABQ1
   cores:
   - name: cortex-m33
@@ -1645,8 +2065,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -1663,6 +2084,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -1671,8 +2093,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -1682,6 +2115,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1690,6 +2124,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3P5EDACQ1
   cores:
   - name: cortex-m33
@@ -1706,8 +2142,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -1724,6 +2161,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -1732,8 +2170,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -1743,6 +2192,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1751,6 +2201,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3P5EDLGQ1
   cores:
   - name: cortex-m33
@@ -1767,8 +2219,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -1785,6 +2238,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -1793,8 +2247,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -1804,6 +2269,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1812,6 +2278,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3P5EDLHQ1
   cores:
   - name: cortex-m33
@@ -1828,8 +2296,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22810000
@@ -1846,6 +2315,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32020000
@@ -1854,8 +2324,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12020000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32810000
@@ -1865,6 +2346,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1873,6 +2355,8 @@ variants:
   flash_algorithms:
   - psc3xxe
   - psc3xxe_s
+  - psc3xxe_dbm1
+  - psc3xxe_dbm1_s
 - name: PSC3P5FDS2ABQ1
   cores:
   - name: cortex-m33
@@ -1889,8 +2373,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -1907,6 +2392,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -1915,8 +2401,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -1926,6 +2423,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1934,6 +2432,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3P5FDS2ACQ1
   cores:
   - name: cortex-m33
@@ -1950,8 +2450,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -1968,6 +2469,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -1976,8 +2478,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -1987,6 +2500,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -1995,6 +2509,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3P5FDS2LGQ1
   cores:
   - name: cortex-m33
@@ -2011,8 +2527,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -2029,6 +2546,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -2037,8 +2555,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -2048,6 +2577,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -2056,6 +2586,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 - name: PSC3P5FDS2LHQ1
   cores:
   - name: cortex-m33
@@ -2072,8 +2604,9 @@ variants:
     - cortex-m33
     access:
       write: false
-  - !Generic
+  - !Nvm
     name: IROM3
+    is_alias: true
     range:
       start: 0x22800000
       end: 0x22820000
@@ -2090,6 +2623,7 @@ variants:
     - cortex-m33
   - !Nvm
     name: IROM2
+    is_alias: true
     range:
       start: 0x32000000
       end: 0x32040000
@@ -2098,8 +2632,19 @@ variants:
     access:
       write: false
       boot: true
-  - !Generic
+  - !Nvm
+    name: IROM_S_CBUS
+    is_alias: true
+    range:
+      start: 0x12000000
+      end: 0x12040000
+    cores:
+    - cortex-m33
+    access:
+      write: false
+  - !Nvm
     name: IROM4
+    is_alias: true
     range:
       start: 0x32800000
       end: 0x32820000
@@ -2109,6 +2654,7 @@ variants:
       write: false
   - !Ram
     name: IRAM2
+    is_alias: true
     range:
       start: 0x34000000
       end: 0x34010000
@@ -2117,6 +2663,8 @@ variants:
   flash_algorithms:
   - psc3xxf
   - psc3xxf_s
+  - psc3xxf_dbm1
+  - psc3xxf_dbm1_s
 flash_algorithms:
 - name: psc3xxe
   description: PSC3xxE
@@ -2163,6 +2711,48 @@ flash_algorithms:
     sectors:
     - size: 0x200
       address: 0x0
+- name: psc3xxe_dbm1
+  description: PSC3xxE
+  instructions: APBeu1PqAgwA8GmALenwS0/wAAYAKx+/s/qD9QP6BfQk+gX2XkASvxZDsvqC9QL6BfTF8SAFHr8i+gX8ROoMBCA1VuoETE/qFEQYv2QcT/AACE/wAAmQQnHrAww50wApGb+x+oH3AfoH9rD6gPcA+gf2x/EgBx6/IPoH/EbqDAYgN7b79Pyn6wUHED8H8B8Ly/EgBiz6BvYM+gv7RL+zRgAmIC+kv15GT/AAC1vqBgwIv0/wAQsZ6wsJSOsGCKv7AnwG+wLMC/sDzMAbcesMAcHnC0YCRkFGSEa96PCLE7UIQxi/T/D/MAFGr/MAgL3oHEBwR7LxIAMK1cLxIAMB+gLxIPoD80HqAwEA+gLwcEcA+gPxT/AAAHBHT/AAAgC1E0aURpZGIDkiv6DoDFCg6AxQsfEgAb/0968JByi/oOgMUEi/DMBd+ATriQAov0D4BCsIv3BHSL8g+AIrEfCATxi/APgBK3BHAPBWuoC1BkkAIkn4ASAFSklEEmiQR73ogEAA8AW4AL8gAAAA4P+AEAxJAUQDKQjYD/IEAN/oAfACDQ8KCUgSMHBHB0mIQgS/ACBwRwVI/TBwRwRIcEcDSAQwcEe1/w9FArBQDQIAUgCAtQVKACNJ+AIwBEsA8NL5veiAQP/31L8gAAAA5P+AEHC1DU4ERlb4IFBW+CAAAPAPAADwFfgGLAbYBuuEAQlsyQVcvwVIcL3F8wMhATEA61EAsPvx8HC9QBIgUgASegAQtQRGAPA0+IyxAiwU2G/wHwEMSgHrRBERRNH40BSx8f8/CdwgRr3oEEAA8Em5BUkJaLHx/z8A3RC9vegQQADwCbkAvzAVIFIISk/0iFMC64AByVgB8AcBBCkCv1L4IBAIIGDzXxGIsnBHAL8AASBSgLX/9+n/AUYAIAYpB9jf6AHwBBAUJycnGwAWSIC9sfWIfxfQQPITEpFCGdENSEBoEuAPSFn4AACAvQxJCUgAaFn4ARCABwLgBkgHScBrAergcIC9A0hAak/0AEEB6hBAgL0AvyQVIFIANm4BEAAAAAwAAAAAEnoAsLUFRgxGCGhcIf/3+v5oASVJClggaAHrRRHC8wFzAnADccLzwGPDcMLzBEPC8wQig3BCcEpo0w9DcyLwf0MS8OBCg2AYvwEiAnOKaNMPw3XC8wBzg3XC8wBjQ3XC8wJD0rICYQN1ymjC8wBjwvOBRMLzAUWA+CgwwvMBU9KywOkGJcDpCEMKaUppiWnB8wZiwfMGQ8HzBiQB8H8BwOkLFMDpDTIAILC9ABogUi3p8EGYsAGtBEZcIShG//ei/mlGIEYAlf/3nP9gARRJCVgAILHx/z8f3J34CBACKRvQnfgFUMWxnfgGYK6xnfgEEAOaEusBZ0DxAAggRv/3Rf+n+wBBpvsFIwj7ABEgRv/37v0ADkDqASAYsL3o8IEAGiBSEUkKaMLzAGNv859CAmDDcUpowvMHQ2/zXzKCgAOBimjC8wFzg3PC8wwjg4EC8A8D0rISCYNywnLJaMHzCELB8wIhAoKBcXBHMBUgUi3p8EGGsAGsFCEgRv/3Q/4gRv/3z/8USAFoACCx8f8/H9yd+BIQAikb0L34CBDBsZ34CyAIRgAh//ca/l/qUQYERt34BIANRk/qMAcAIP/35f7g+wh2IkYrRjFGOEb/94/9BrC96PCBMBUgUgE4ASiYv//3Zb8AIHBHAPC9uADwlbgAAHC1T/D/MhWjwOkAIg5KEmgS9IBSDaIIvxNGA/EEAk/wBAMIvwIjc7FS+ARMjEID2BVoLhmOQgLYCDIBO/PnYhoqRMDpABJwvQAAFVIAAAAiAAACAAAAADIAAAIAAAAAIgAAAQAAAAAyAAABAAAAgCIAAAEAAACAMgAAAQBKRBtoGEcA8L+4AACwtR5MACB8RKBHE00TSUn4BQBJ+AEAASCgRxFJE0pJ+AEAWfgFAA9JSfgBAA5JAUQA8ucwsfvy8Q1KCfgCEE/0enGw+/HwC0lJ+AEAACCgRwlJSfgBALC9HAAAAFQAAABYAAAAXAAAAD9CDwBAQg8AZAAAAGAAAABQAAAAV/z//wAgcEcA8MK4ObEQ+AE7ATmTQhy/ASBwR/bnACBwRwAAcLURSgRGWfgCEEgcT/ABABjQSkRSaAEyFNBgGkDy/xKQQwhEoPUAdQD1AHYF9QB1tUIkvwAgcL0gRv/3f/0AKPTQASBwvQC/aAAAALC1D01Z+AVAYBxP8AEAFtAJ6wUBSWgBMRHQCesFAVn4BQBJaAhEhEIkvwAgsL0gRv/3Xv0E9QB0ACju0AEgsL1oAAAAvLUBRmhG//cf/93pABINSEn4ABBIRAExsfqB8UJgUBxJCbD6gPBACVHqAAQI0QZNGfgFACC5//dL/wEgCfgFACBGvL1oAAAABAAAAC3p+EXf+ICABkZZ+AgAATBP8AEAMtANRgnrCAFJaAExLNAaSBRGACeCRgAgMLsts1n4CAAwGrfrUC8J0VBG2vgAAAAKLigD2DBG//cJ/bi5MEYhRv/3Nv0AKAFGGL8BIbfrVS8J0AAoGL8BIAT1AHQG9QB2pfUAddjnCEa96PiFASC96PiFAL9oAAAACBRAE7C1ACOZQgbQ1FzFXKxCAdEBM/fnGUYIRLC9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADZuAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2bgEANm4BADZuAQA2bgHAXQAAGAAAAAAAACIAAAIAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  pc_init: 0x1
+  pc_uninit: 0x611
+  pc_program_page: 0x58b
+  pc_erase_sector: 0x503
+  pc_erase_all: 0x4ff
+  pc_verify: 0x615
+  data_section_offset: 0x7b8
+  flash_properties:
+    address_range:
+      start: 0x22800000
+      end: 0x22810000
+    page_size: 0x200
+    erased_byte_value: 0x0
+    program_page_timeout: 1000
+    erase_sector_timeout: 5000
+    sectors:
+    - size: 0x200
+      address: 0x0
+- name: psc3xxe_dbm1_s
+  description: PSC3xxE
+  instructions: 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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  pc_init: 0x1
+  pc_uninit: 0x611
+  pc_program_page: 0x58b
+  pc_erase_sector: 0x503
+  pc_erase_all: 0x4ff
+  pc_verify: 0x615
+  data_section_offset: 0x7b8
+  flash_properties:
+    address_range:
+      start: 0x32800000
+      end: 0x32810000
+    page_size: 0x200
+    erased_byte_value: 0x0
+    program_page_timeout: 1000
+    erase_sector_timeout: 5000
+    sectors:
+    - size: 0x200
+      address: 0x0
 - name: psc3xxf
   description: PSC3xxF
   default: true
@@ -2201,6 +2791,48 @@ flash_algorithms:
     address_range:
       start: 0x32000000
       end: 0x32040000
+    page_size: 0x200
+    erased_byte_value: 0x0
+    program_page_timeout: 1000
+    erase_sector_timeout: 5000
+    sectors:
+    - size: 0x200
+      address: 0x0
+- name: psc3xxf_dbm1
+  description: PSC3xxF
+  instructions: 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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  pc_init: 0x1
+  pc_uninit: 0x611
+  pc_program_page: 0x58b
+  pc_erase_sector: 0x503
+  pc_erase_all: 0x4ff
+  pc_verify: 0x615
+  data_section_offset: 0x7b8
+  flash_properties:
+    address_range:
+      start: 0x22800000
+      end: 0x22820000
+    page_size: 0x200
+    erased_byte_value: 0x0
+    program_page_timeout: 1000
+    erase_sector_timeout: 5000
+    sectors:
+    - size: 0x200
+      address: 0x0
+- name: psc3xxf_dbm1_s
+  description: PSC3xxF
+  instructions: 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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  pc_init: 0x1
+  pc_uninit: 0x611
+  pc_program_page: 0x58b
+  pc_erase_sector: 0x503
+  pc_erase_all: 0x4ff
+  pc_verify: 0x615
+  data_section_offset: 0x7b8
+  flash_properties:
+    address_range:
+      start: 0x32800000
+      end: 0x32820000
     page_size: 0x200
     erased_byte_value: 0x0
     program_page_timeout: 1000

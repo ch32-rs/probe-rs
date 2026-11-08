@@ -8,13 +8,24 @@ use probe_rs::config::Registry;
 use probe_rs::probe::WireProtocol;
 use probe_rs::{
     Target,
-    probe::{DebugProbeSelector, Probe, list::Lister},
+    probe::{
+        DebugProbeSelector, Probe,
+        list::{Accessibility, Lister},
+    },
 };
 use serde::Deserialize;
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
+
+/// Time without power during a power cycle.
+#[cfg(target_os = "linux")]
+const POWER_OFF_TIME: Duration = Duration::from_secs(1);
+
+/// Time to wait for the probe to come back after a power cycle.
+const REENUMERATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize)]
 struct RawDutDefinition {
@@ -29,6 +40,9 @@ struct RawDutDefinition {
 
     #[serde(default)]
     reset_connected: bool,
+
+    #[serde(default)]
+    cycle_power: bool,
 }
 
 impl RawDutDefinition {
@@ -70,6 +84,12 @@ pub struct DutDefinition {
     /// Indicates if the probe can control the reset pin of the
     /// DUT.
     pub reset_connected: bool,
+
+    /// Cycle the USB port power of the probe before each test.
+    ///
+    /// Only supported on Linux. The user needs write access to the
+    /// `disable` file of the USB port in sysfs.
+    pub cycle_power: bool,
 }
 
 impl DutDefinition {
@@ -120,10 +140,45 @@ impl DutDefinition {
         DutDefinition::from_raw_definition(raw_definition, file)
     }
 
+    /// Check that the configured probe shows up when listing probes, and that the
+    /// current user is allowed to access it.
+    pub fn assert_listed(&self) -> Result<()> {
+        let lister = Lister::new();
+        let probes = lister.list_all_with_access();
+
+        let listed = match &self.probe_selector {
+            Some(selector) => probes
+                .iter()
+                .find(|probe| selector.matches_probe(&probe.info))
+                .with_context(|| {
+                    format!("Probe with selector {selector} did not show up when listing probes")
+                })?,
+            None => {
+                anyhow::ensure!(
+                    !probes.is_empty(),
+                    "No probes detected when listing probes!"
+                );
+                &probes[0]
+            }
+        };
+
+        anyhow::ensure!(
+            listed.accessibility == Accessibility::Accessible,
+            "Probe was listed but reported as not accessible: {}",
+            listed.info
+        );
+
+        Ok(())
+    }
+
     pub fn open_probe(&self) -> Result<Probe> {
         let lister = Lister::new();
 
         let mut probe = match &self.probe_selector {
+            Some(selector) if self.cycle_power => {
+                power_cycle(selector)?;
+                open_after_power_cycle(&lister, selector)?
+            }
             Some(selector) => lister
                 .open(selector.clone())
                 .with_context(|| format!("Failed to open probe with selector {selector}"))?,
@@ -178,7 +233,54 @@ impl DutDefinition {
             probe_selector,
             flash_test_binary,
             reset_connected: raw_definition.reset_connected,
+            cycle_power: raw_definition.cycle_power,
         })
+    }
+}
+
+/// Turn off the power of the USB port of the probe, then turn it on again.
+#[cfg(target_os = "linux")]
+fn power_cycle(selector: &DebugProbeSelector) -> Result<()> {
+    use nusb::MaybeFuture;
+
+    let device = nusb::list_devices()
+        .wait()?
+        .find(|device| selector.matches(device))
+        .with_context(|| format!("Probe with selector {selector} not found"))?;
+
+    // The port directory belongs to the hub. It stays when the probe disconnects.
+    let disable = std::fs::canonicalize(device.sysfs_path().join("port"))
+        .context("Failed to find the USB port of the probe")?
+        .join("disable");
+
+    std::fs::write(&disable, "1")
+        .with_context(|| format!("Failed to turn off power at {}", disable.display()))?;
+    std::thread::sleep(POWER_OFF_TIME);
+    std::fs::write(&disable, "0")
+        .with_context(|| format!("Failed to turn on power at {}", disable.display()))?;
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn power_cycle(_selector: &DebugProbeSelector) -> Result<()> {
+    anyhow::bail!("USB power cycling is only supported on Linux")
+}
+
+/// Open the probe. Retry until the probe enumerates again and udev
+/// gives access to it.
+fn open_after_power_cycle(lister: &Lister, selector: &DebugProbeSelector) -> Result<Probe> {
+    let start = Instant::now();
+    loop {
+        match lister.open(selector.clone()) {
+            Ok(probe) => return Ok(probe),
+            Err(error) if start.elapsed() >= REENUMERATION_TIMEOUT => {
+                return Err(error).with_context(|| {
+                    format!("Failed to open probe with selector {selector} after power cycle")
+                });
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
     }
 }
 

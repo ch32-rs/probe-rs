@@ -16,11 +16,13 @@ mod chip_family;
 mod flash_algorithm;
 mod flash_properties;
 mod memory;
+mod memory_port;
 pub(crate) mod serialize;
 
 pub use chip::{
     ApAddress, ArmCoreAccessOptions, Chip, Core, CoreAccessOptions, Jtag, RiscvCoreAccessOptions,
-    RiscvJtagTunnel, ScanChainElement, XtensaCoreAccessOptions,
+    RiscvJtagTunnel, ScanChainElement, XtensaCoreAccessOptions, XtensaCoreProperties,
+    XtensaFpuProperties, XtensaWindowProperties,
 };
 pub use chip_family::{
     Architecture, ChipFamily, CoreType, Endian, InstructionSet, TargetDescriptionSource,
@@ -31,6 +33,7 @@ pub use memory::{
     GenericRegion, MemoryAccess, MemoryRange, MemoryRegion, NvmRegion, PageInfo, RamRegion,
     RegionMergeIterator, SectorDescription, SectorInfo,
 };
+pub use memory_port::{ArmMemoryPortOptions, MemoryPort, MemoryPortOptions};
 
 #[cfg(feature = "bincode")]
 mod builtin_targets {

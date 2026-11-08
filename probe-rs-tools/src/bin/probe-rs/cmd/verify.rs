@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
-use crate::FormatOptions;
-use crate::rpc::client::RpcClient;
-use crate::rpc::functions::flash::VerifyResult;
 use crate::util::cli;
 use crate::util::common_options::ProbeOptions;
 use crate::util::flash::CliProgressBars;
+use probe_rs_rpc::flash::VerifyResult;
+use probe_rs_rpc::format::FormatOptions;
+use probe_rs_rpc_client::RpcClient;
 
 #[derive(clap::Parser)]
 pub struct Cmd {
@@ -41,6 +41,7 @@ impl Cmd {
                 self.format_options,
                 None,
                 self.read_flasher_rtt,
+                None,
             )
             .await?;
 
@@ -53,10 +54,13 @@ impl Cmd {
             .await?;
 
         match result {
-            VerifyResult::Ok => println!("Verification successful"),
-            VerifyResult::Mismatch => println!("Verification failed: contents do not match"),
+            VerifyResult::Ok => {
+                println!("Verification successful");
+                Ok(())
+            }
+            VerifyResult::Mismatch => {
+                anyhow::bail!("Verification failed: contents do not match")
+            }
         }
-
-        Ok(())
     }
 }

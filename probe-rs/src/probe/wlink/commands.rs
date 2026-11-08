@@ -1,5 +1,7 @@
 //! WCH-LinkRV commands
 
+use std::time::Duration;
+
 use super::{DMI_OP_NOP, DMI_OP_READ, DMI_OP_WRITE, RiscvChip, WchLinkError, WchLinkVariant};
 
 /// Only part of commands are implemented
@@ -19,6 +21,7 @@ pub enum CommandId {
 
 pub(crate) trait WchLinkCommand {
     const COMMAND_ID: CommandId;
+    const TIMEOUT: Duration = Duration::from_millis(100);
     type Response: WchLinkCommandResponse;
 
     fn payload(&self) -> Vec<u8>;
@@ -91,6 +94,12 @@ impl WchLinkCommandResponse for u8 {
     }
 }
 
+impl WchLinkCommandResponse for Vec<u8> {
+    fn from_payload(bytes: &[u8]) -> Result<Self, WchLinkError> {
+        Ok(bytes.to_vec())
+    }
+}
+
 /// Get current probe info, version, etc
 #[derive(Debug)]
 pub struct GetProbeInfo;
@@ -152,10 +161,26 @@ impl WchLinkCommandResponse for AttachChipResponse {
 
 impl WchLinkCommand for AttachChip {
     const COMMAND_ID: CommandId = CommandId::Control;
+    const TIMEOUT: Duration = Duration::from_secs(1);
     type Response = AttachChipResponse;
 
     fn payload(&self) -> Vec<u8> {
         vec![0x02]
+    }
+}
+
+/// CH565/CH569 post-attach setup. wlink sends `81 0d 01 04` for the CH56X
+/// family right after attach. Without it, accessing the flash window fails
+/// with an abstract command exception, so the device cannot be flashed.
+#[derive(Debug)]
+pub struct EnableCh56xFlash;
+
+impl WchLinkCommand for EnableCh56xFlash {
+    const COMMAND_ID: CommandId = CommandId::Control;
+    type Response = Vec<u8>;
+
+    fn payload(&self) -> Vec<u8> {
+        vec![0x04]
     }
 }
 
@@ -296,6 +321,28 @@ impl WchLinkCommand for ResetTarget {
     }
 }
 
+/// Drive the RST pin of the probe. Only the WCH-LinkE and WCH-LinkW have this pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetRstPin {
+    /// Drive the pin low, which resets the target.
+    Low,
+    /// Release the pin. The pull-up of the target pulls it high.
+    Floating,
+}
+
+impl WchLinkCommand for SetRstPin {
+    const COMMAND_ID: CommandId = CommandId::Control;
+    type Response = ();
+
+    fn payload(&self) -> Vec<u8> {
+        let level = match self {
+            SetRstPin::Low => 0x13,
+            SetRstPin::Floating => 0x15,
+        };
+        vec![0x0e, level]
+    }
+}
+
 /// Check flash protection status
 #[derive(Debug)]
 pub struct CheckFlashProtection;
@@ -317,5 +364,50 @@ impl WchLinkCommand for UnprotectFlash {
 
     fn payload(&self) -> Vec<u8> {
         vec![0x02]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AttachChipResponse, RiscvChip, SetRstPin, SetSpeed, Speed, WchLinkCommand,
+        WchLinkCommandResponse, WchLinkError,
+    };
+
+    #[test]
+    fn attach_v4x7() {
+        let response = AttachChipResponse::from_payload(&[0xa6, 0x46, 0x74, 0x00, 0x11]).unwrap();
+        assert_eq!(response.chip_family, RiscvChip::CH32V4X7);
+        assert_eq!(response.riscvchip, 0xa6);
+        assert_eq!(response.chip_id, 0x4674_0011);
+        assert!(!response.chip_family.support_flash_protect());
+    }
+
+    #[test]
+    fn attach_unknown_family_still_fails() {
+        assert!(matches!(
+            AttachChipResponse::from_payload(&[0xff, 0x46, 0x74, 0x00, 0x01]),
+            Err(WchLinkError::UnknownChip(0xff))
+        ));
+    }
+
+    #[test]
+    fn set_v4x7_speed_bytes() {
+        let speed = Speed::from_khz(1000).unwrap();
+        let command = SetSpeed(RiscvChip::CH32V4X7, speed);
+        let mut buffer = [0u8; 8];
+        let len = command.to_bytes(&mut buffer).unwrap();
+        assert_eq!(buffer[0..4], [0x81, 0x0c, 0x02, 0xa6]);
+        assert_eq!(len, 5);
+        assert_eq!(buffer[4], speed as u8);
+    }
+
+    #[test]
+    fn set_rst_pin_bytes() {
+        let mut buffer = [0u8; 8];
+        let len = SetRstPin::Low.to_bytes(&mut buffer).unwrap();
+        assert_eq!(buffer[..len], [0x81, 0x0d, 0x02, 0x0e, 0x13]);
+        let len = SetRstPin::Floating.to_bytes(&mut buffer).unwrap();
+        assert_eq!(buffer[..len], [0x81, 0x0d, 0x02, 0x0e, 0x15]);
     }
 }

@@ -8,8 +8,10 @@ use crate::{
         Vendor,
         nxp::sequences::{
             mcx::MCX,
+            mimxrt7xx::MIMXRT7xx,
+            mkl82::MKL82,
             nxp_armv6m::LPC80x,
-            nxp_armv7m::{MIMXRT10xx, MIMXRT11xx},
+            nxp_armv7m::{MIMXRT10xx, MIMXRT11xx, S32K3xx},
             nxp_armv8m::{
                 LPC55Sxx, MIMXRT5xxS, MIMXRT118x,
                 MIMXRTFamily::{MIMXRT5, MIMXRT6},
@@ -37,6 +39,8 @@ impl Vendor for Nxp {
             DebugSequence::Arm(MIMXRT5xxS::create(MIMXRT5))
         } else if chip.name.starts_with("MIMXRT6") {
             DebugSequence::Arm(MIMXRT5xxS::create(MIMXRT6))
+        } else if chip.name.starts_with("MIMXRT7") {
+            DebugSequence::Arm(MIMXRT7xx::create())
         } else if chip.name.starts_with("LPC55S") {
             DebugSequence::Arm(LPC55Sxx::create())
         } else if chip.name.starts_with("LPC802") || chip.name.starts_with("LPC804") {
@@ -45,6 +49,10 @@ impl Vendor for Nxp {
             DebugSequence::Arm(OL23D0::create())
         } else if chip.name.starts_with("MCX") {
             DebugSequence::Arm(MCX::create(chip.name.clone()))
+        } else if chip.name.starts_with("S32K3") {
+            DebugSequence::Arm(S32K3xx::create(chip))
+        } else if chip.name.starts_with("MKL82") {
+            DebugSequence::Arm(MKL82::create())
         } else {
             return None;
         };

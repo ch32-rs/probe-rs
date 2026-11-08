@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::memory::MemoryRegion;
 use crate::{
-    CoreType,
+    CoreType, MemoryPort,
     serialize::{hex_option, hex_u_int},
 };
 use serde::{Deserialize, Serialize};
@@ -87,6 +87,9 @@ pub struct Chip {
     /// The cores available on the chip.
     #[serde(default)]
     pub cores: Vec<Core>,
+    /// The memory ports available on the chip.
+    #[serde(default)]
+    pub memory_ports: Vec<MemoryPort>,
     /// The memory regions available on the chip.
     pub memory_map: Vec<MemoryRegion>,
     /// Names of all flash algorithms available for this chip.
@@ -120,6 +123,14 @@ pub struct Chip {
     // TODO: rename to default_platform
     #[serde(default)]
     pub default_binary_format: Option<String>,
+    /// Skip the reset that normally precedes RAM flashing when booting from RAM.
+    ///
+    /// Normally, before writing the image into RAM, probe-rs resets and halts the core to
+    /// guarantee a clear state. Some targets (e.g. the Zynq-7000 series) are expected to
+    /// already be reset by other tooling before RAM flashing runs, and resetting them again
+    /// would undo that setup. In that case, the core is only halted, not reset.
+    #[serde(default)]
+    pub skip_reset_on_ram_boot: bool,
 }
 
 impl Chip {
@@ -143,6 +154,8 @@ impl Chip {
             rtt_scan_ranges: None,
             jtag: None,
             default_binary_format: None,
+            memory_ports: vec![],
+            skip_reset_on_ram_boot: false,
         }
     }
 
@@ -239,7 +252,41 @@ pub struct RiscvCoreAccessOptions {
 
 /// The data required to access an Xtensa core
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct XtensaCoreAccessOptions {
     /// The JTAG TAP index of the core's debug module
     pub jtag_tap: Option<usize>,
+
+    /// CPU properties for this core
+    pub core_properties: XtensaCoreProperties,
+}
+
+/// Xtensa CPU properties from a target description
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XtensaCoreProperties {
+    /// Interrupt level at which debug exceptions are generated
+    pub debug_level: u8,
+    /// Number of hardware breakpoints
+    pub hw_breakpoint_num: u32,
+    /// Floating-point coprocessor properties, if implemented
+    pub fpu: Option<XtensaFpuProperties>,
+    /// Windowed register option properties
+    pub window_properties: Option<XtensaWindowProperties>,
+}
+
+/// Floating-point coprocessor properties from a target description
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XtensaFpuProperties {
+    /// Whether the FPU supports double-precision operations
+    pub double_precision: bool,
+}
+
+/// Windowed register option properties from a target description
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XtensaWindowProperties {
+    /// The total number of AR registers in the register file
+    pub num_aregs: u8,
 }

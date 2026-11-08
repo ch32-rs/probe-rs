@@ -1,44 +1,63 @@
 //! Probe drivers
+mod bits;
 pub(crate) mod common;
 pub mod usb_util;
 
 pub mod blackmagic;
-pub mod ch347usbjtag;
+pub mod ch347;
 pub mod cmsisdap;
 pub mod fake_probe;
 pub mod ftdi;
 pub mod glasgow;
 pub mod jlink;
+pub mod jtag;
 pub mod list;
 pub(crate) mod queue;
 mod selector;
 pub mod sifliuart;
 pub mod stlink;
+pub mod swd;
+pub mod ti_icdi;
 pub mod wlink;
+pub mod xvc;
 
+use crate::CoreStatus;
 use crate::architecture::arm::sequences::{ArmDebugSequence, DefaultArmSequence};
-use crate::architecture::arm::{ArmDebugInterface, ArmError};
-use crate::architecture::arm::{RegisterAddress, SwoAccess, communication_interface::DapProbe};
+use crate::architecture::arm::{
+    ArmDebugInterface, ArmError, SwoAccess,
+    communication_interface::{ArmCommunicationInterface, probe_debug_port_wire},
+    traits::DebugPortWire,
+};
 use crate::architecture::riscv::communication_interface::{RiscvError, RiscvInterfaceBuilder};
 use crate::architecture::xtensa::communication_interface::{
     XtensaCommunicationInterface, XtensaDebugInterfaceState, XtensaError,
 };
 use crate::config::TargetSelector;
 use crate::config::registry::Registry;
-use crate::probe::common::JtagState;
-use crate::probe::queue::{BatchExecutionError, DeferredResultSet, ErasedQueue};
 use crate::{Error, Permissions, Session};
 use bitvec::slice::BitSlice;
-use bitvec::vec::BitVec;
 use common::ScanChainError;
 use parking_lot::RwLock;
-use probe_rs_target::ScanChainElement;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fmt;
 use std::sync::{Arc, LazyLock};
 
+pub use bits::BitSequence;
+pub use jtag::chain::ChainParams;
+pub use jtag::{
+    BitbangJtag, JtagBatch, JtagChain, JtagChainAccess, JtagChainState, JtagOp, JtagProbe, TapState,
+};
+pub use queue::{
+    Batch, BatchError, BatchExecutionError, ErasedBatch, Handle, HandleId, JtagQueue, Results,
+};
+#[allow(deprecated)]
+pub use queue::{DeferredResultIndex, DeferredResultSet, ErasedQueue, Queue};
 pub use selector::DebugProbeSelector;
+pub use swd::{
+    BitbangSwd, Direction, IoSequenceItem, Pins, Port, SwdBatch, SwdOp, SwdPort, SwdProbe,
+    SwdSettings, SwdTransferError,
+};
 
 /// Used to log warnings when the measured target voltage is
 /// lower than 1.4V, if at all measurable.
@@ -54,7 +73,9 @@ static DRIVERS: LazyLock<RwLock<Vec<&'static dyn ProbeFactory>>> = LazyLock::new
         &wlink::WchLinkFactory,
         &sifliuart::SifliUartFactory,
         &glasgow::GlasgowFactory,
-        &ch347usbjtag::Ch347UsbJtagFactory,
+        &ch347::Ch347Factory,
+        &xvc::XvcFactory,
+        &ti_icdi::IcdiFactory,
     ];
 
     RwLock::new(probes)
@@ -100,30 +121,11 @@ impl std::str::FromStr for WireProtocol {
     }
 }
 
-/// A command queued in a batch for later execution
-///
-/// Mostly used internally but returned in DebugProbeError to indicate
-/// which batched command actually encountered the error.
-#[derive(Clone, Debug)]
-pub enum BatchCommand {
-    /// Read from a port
-    Read(RegisterAddress),
-
-    /// Write to a port
-    Write(RegisterAddress, u32),
-}
-
-impl fmt::Display for BatchCommand {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            BatchCommand::Read(port) => {
-                write!(f, "Read(port={port:?})")
-            }
-            BatchCommand::Write(port, data) => {
-                write!(f, "Write(port={port:?}, data={data:#010x})")
-            }
-        }
-    }
+/// Sends a line reset, the SWJ-DP SWD to JTAG switch sequence and a TAP reset.
+fn switch_swd_to_jtag(wire: &mut dyn DebugPortWire) -> Result<(), ArmError> {
+    wire.swj_sequence(&BitSequence::from_u64(51, (1 << 51) - 1))?;
+    wire.swj_sequence(&BitSequence::from_u64(16, 0xE73C))?;
+    wire.swj_sequence(&BitSequence::from_u64(6, 0x3F))
 }
 
 /// Marker trait for all probe errors.
@@ -218,8 +220,8 @@ pub enum DebugProbeError {
     /// Failed to find or attach to the target. Please check the wiring before retrying.
     TargetNotFound,
 
-    /// Error in previous batched command.
-    BatchError(BatchCommand),
+    /// The reset line of the probe cannot be used: `reset_line_connected` is false for this probe.
+    ResetLineNotConnected,
 
     /// The '{function_name}' functionality is not implemented yet.
     ///
@@ -240,6 +242,9 @@ pub enum DebugProbeError {
 
     /// An error occurred handling the JTAG scan chain.
     JtagScanChain(#[from] ScanChainError),
+
+    /// An SWD transfer received an error response from the target.
+    SwdTransfer(#[from] swd::SwdTransferError),
 
     /// Some other error occurred
     #[display("{0}")]
@@ -289,6 +294,46 @@ impl<T: ProbeError> From<T> for ProbeCreationError {
     }
 }
 
+/// The `reset_line_connected` setting of a probe.
+///
+/// A probe driver keeps one, and checks it before it asserts the reset line. Release and read
+/// of the reset line stay possible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResetLine {
+    connected: bool,
+}
+
+impl Default for ResetLine {
+    fn default() -> Self {
+        Self { connected: true }
+    }
+}
+
+impl ResetLine {
+    /// Sets whether the reset line is connected to the target.
+    pub fn set_connected(&mut self, connected: bool) {
+        self.connected = connected;
+    }
+
+    /// Fails if the reset line is not connected.
+    pub fn check_assert(&self) -> Result<(), DebugProbeError> {
+        if self.connected {
+            Ok(())
+        } else {
+            Err(DebugProbeError::ResetLineNotConnected)
+        }
+    }
+
+    /// Fails if the reset line is not connected and the pins drive nRESET low.
+    pub fn check_pins(&self, out: swd::Pins, select: swd::Pins) -> Result<(), DebugProbeError> {
+        if select.nreset() && !out.nreset() {
+            self.check_assert()
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// The Probe struct is a generic wrapper over the different
 /// probes supported.
 ///
@@ -316,10 +361,7 @@ pub struct Probe {
 impl Probe {
     /// Create a new probe from a more specific probe driver.
     pub fn new(probe: impl DebugProbe + 'static) -> Self {
-        Self {
-            inner: Box::new(probe),
-            attached: false,
-        }
+        Self::from_specific_probe(Box::new(probe))
     }
 
     pub(crate) fn from_attached_probe(probe: Box<dyn DebugProbe>) -> Self {
@@ -335,6 +377,13 @@ impl Probe {
             inner: probe,
             attached: false,
         }
+    }
+
+    /// Sets whether the reset line of the probe is connected to the target. If it is not,
+    /// all operations that assert the reset line fail. See
+    /// [`DebugProbe::set_reset_line_connected`].
+    pub fn set_reset_line_connected(&mut self, connected: bool) {
+        self.inner.set_reset_line_connected(connected);
     }
 
     /// Get the human readable name for the probe.
@@ -383,13 +432,44 @@ impl Probe {
     pub fn attach_to_unspecified(&mut self) -> Result<(), Error> {
         self.inner.attach()?;
         self.attached = true;
+
+        // A debug port with SWJ pin switching that an earlier session left in SWD mode keeps
+        // its JTAG TAPs off TDO, so the scan below would find an empty chain. The switch
+        // sequence never enters a Capture or Update state, so JTAG-only TAPs ignore it.
+        if self.protocol() == Some(WireProtocol::Jtag)
+            && self.inner.try_as_jtag_chain_access_mut().is_some()
+            && let Err(error) = self.with_debug_port_wire(switch_swd_to_jtag)
+        {
+            tracing::debug!("Unable to send the SWD to JTAG switch sequence: {error}");
+        }
+
+        // A JTAG consumer needs the padding parameters of a TAP. Select the first one, so that a
+        // caller that does not know the chain can access the target. A chain that is not visible
+        // yet is not an error here: a debug sequence may route the TAP later.
+        if self.protocol() == Some(WireProtocol::Jtag)
+            && let Some(mut chain) = self.try_as_jtag_chain()
+            && let Err(error) = chain.select(0)
+        {
+            tracing::debug!("Unable to select JTAG TAP 0: {error}");
+        }
+
         Ok(())
+    }
+
+    /// Run a debug-port wire operation before the ARM interface is created.
+    pub fn with_debug_port_wire<R>(
+        &mut self,
+        f: impl FnOnce(&mut dyn DebugPortWire) -> Result<R, ArmError>,
+    ) -> Result<R, ArmError> {
+        probe_debug_port_wire(self.inner.as_mut(), f)
     }
 
     /// A combination of [`Probe::attach_to_unspecified`] and [`Probe::attach_under_reset`].
     pub fn attach_to_unspecified_under_reset(&mut self) -> Result<(), Error> {
-        if let Some(dap_probe) = self.try_as_dap_probe() {
-            DefaultArmSequence(()).reset_hardware_assert(dap_probe)?;
+        if self.inner.try_as_swd_probe_mut().is_some()
+            || self.inner.try_as_jtag_chain_access_mut().is_some()
+        {
+            self.with_debug_port_wire(|wire| DefaultArmSequence(()).reset_hardware_assert(wire))?;
         } else {
             tracing::info!(
                 "Custom reset sequences are not supported on {}.",
@@ -558,12 +638,28 @@ impl Probe {
         sequence: Arc<dyn ArmDebugSequence>,
     ) -> Result<Box<dyn ArmDebugInterface + 'probe>, (Self, ArmError)> {
         if !self.attached {
-            Err((self, DebugProbeError::NotAttached.into()))
-        } else {
-            self.inner
-                .try_get_arm_debug_interface(sequence)
-                .map_err(|(probe, err)| (Probe::from_attached_probe(probe), err))
+            return Err((self, DebugProbeError::NotAttached.into()));
         }
+
+        let interface = match self.inner.try_get_arm_debug_interface(sequence.clone()) {
+            Ok(interface) => interface,
+            Err((probe, err)) => match probe.try_as_swd_probe() {
+                Ok(swd_probe) => {
+                    let settings = swd_probe.swd_settings();
+                    // A probe that answers WAIT itself paces the transfers, the
+                    // others need overrun detection for stable communication.
+                    let use_overrun_detect = !swd_probe.handles_wait();
+                    ArmCommunicationInterface::create_swd(
+                        swd_probe,
+                        settings,
+                        sequence,
+                        use_overrun_detect,
+                    )
+                }
+                Err(probe) => return Err((Probe::from_attached_probe(probe), err)),
+            },
+        };
+        Ok(interface)
     }
 
     /// Check if the probe has an interface to debug RISC-V chips.
@@ -588,9 +684,17 @@ impl Probe {
         }
     }
 
-    /// Returns a [`JtagAccess`] from the debug probe, if implemented.
-    pub fn try_as_jtag_probe(&mut self) -> Option<&mut dyn JtagAccess> {
-        self.inner.try_as_jtag_probe()
+    /// Returns a [`JtagChain`] from the debug probe, if implemented.
+    pub fn try_as_jtag_chain(&mut self) -> Option<JtagChain<'_>> {
+        self.inner.try_as_jtag_chain()
+    }
+
+    pub(crate) fn try_as_swd_probe_mut(&mut self) -> Option<&mut dyn SwdProbe> {
+        self.inner.try_as_swd_probe_mut()
+    }
+
+    pub(crate) fn try_as_jtag_chain_access_mut(&mut self) -> Option<&mut dyn JtagChainAccess> {
+        self.inner.try_as_jtag_chain_access_mut()
     }
 
     /// Gets a SWO interface from the debug probe.
@@ -605,13 +709,6 @@ impl Probe {
     /// This does not work on all probes.
     pub fn get_swo_interface_mut(&mut self) -> Option<&mut dyn SwoAccess> {
         self.inner.get_swo_interface_mut()
-    }
-
-    /// Gets a DAP interface from the debug probe.
-    ///
-    /// This does not work on all probes.
-    pub fn try_as_dap_probe(&mut self) -> Option<&mut dyn DapProbe> {
-        self.inner.try_as_dap_probe()
     }
 
     /// Try reading the target voltage of via the connected voltage pin.
@@ -639,18 +736,26 @@ pub trait ProbeFactory: std::any::Any + std::fmt::Display + std::fmt::Debug + Sy
     /// When opening, it will open the first probe which succeeds during this call.
     fn open(&self, selector: &DebugProbeSelector) -> Result<Box<dyn DebugProbe>, DebugProbeError>;
 
-    /// Returns a list of all available debug probes of the current type.
-    fn list_probes(&self) -> Vec<DebugProbeInfo>;
+    /// Returns a list of all available debug probes of the current type, each annotated with
+    /// whether the current process can access it.
+    fn list_probes(&self) -> Vec<list::ProbeListItem>;
 
     /// Returns a list of probes that match the optional selector.
     ///
     /// If the selector is `None`, all available probes are returned.
-    fn list_probes_filtered(&self, selector: Option<&DebugProbeSelector>) -> Vec<DebugProbeInfo> {
+    fn list_probes_filtered(
+        &self,
+        selector: Option<&DebugProbeSelector>,
+    ) -> Vec<list::ProbeListItem> {
         // The default implementation falls back to listing all probes so that drivers don't need
         // to deal with the common filtering logic.
         self.list_probes()
             .into_iter()
-            .filter(|probe| selector.as_ref().is_none_or(|s| s.matches_probe(probe)))
+            .filter(|probe| {
+                selector
+                    .as_ref()
+                    .is_none_or(|s| s.matches_probe(&probe.info))
+            })
             .collect()
     }
 }
@@ -705,6 +810,15 @@ pub trait DebugProbe: Any + Send + fmt::Debug {
     /// This should deassert the reset pin of the target via debug probe.
     fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError>;
 
+    /// Tells the probe that its reset line is connected to the target, or not.
+    ///
+    /// If `connected` is false, the probe must not assert its reset line:
+    /// [`DebugProbe::target_reset`], [`DebugProbe::target_reset_assert`] and pin operations that
+    /// drive nRESET low fail with [`DebugProbeError::ResetLineNotConnected`]. Use [`ResetLine`]
+    /// for these checks. A probe that does not use its reset line by default can use it after
+    /// this is called with `true`.
+    fn set_reset_line_connected(&mut self, connected: bool);
+
     /// Selects the transport protocol to be used by the debug probe.
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError>;
 
@@ -716,8 +830,8 @@ pub trait DebugProbe: Any + Send + fmt::Debug {
         false
     }
 
-    /// Returns a [`JtagAccess`] from the debug probe, if implemented.
-    fn try_as_jtag_probe(&mut self) -> Option<&mut dyn JtagAccess> {
+    /// Returns a [`JtagChain`] from the debug probe, if implemented.
+    fn try_as_jtag_chain(&mut self) -> Option<JtagChain<'_>> {
         None
     }
 
@@ -789,10 +903,28 @@ pub trait DebugProbe: Any + Send + fmt::Debug {
     /// Boxes itself.
     fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe>;
 
-    /// Try creating a DAP interface for the given probe.
+    /// Inform the probe of the [`CoreStatus`] of the chip attached to the probe.
+    fn core_status_notification(&mut self, _state: CoreStatus) -> Result<(), DebugProbeError> {
+        Ok(())
+    }
+
+    /// Convert this probe into a layer-0 SWD probe, if it implements [`SwdProbe`].
     ///
-    /// This is not available on all probes.
-    fn try_as_dap_probe(&mut self) -> Option<&mut dyn DapProbe> {
+    /// A probe in JTAG mode refuses, so that the caller uses the JTAG transport.
+    fn try_as_swd_probe(self: Box<Self>) -> Result<Box<dyn SwdProbe>, Box<dyn DebugProbe>> {
+        Err(self.into_probe())
+    }
+
+    /// Borrow this probe as a layer-0 SWD probe, if it implements [`SwdProbe`].
+    ///
+    /// A probe in JTAG mode may return itself, to run SWJ sequences and pin operations on the
+    /// JTAG pins.
+    fn try_as_swd_probe_mut(&mut self) -> Option<&mut dyn SwdProbe> {
+        None
+    }
+
+    /// Borrow this probe as a layer-0 JTAG chain driver, if it implements [`JtagChainAccess`].
+    fn try_as_jtag_chain_access_mut(&mut self) -> Option<&mut dyn JtagChainAccess> {
         None
     }
 
@@ -832,6 +964,12 @@ pub struct DebugProbeInfo {
 
     /// This is a composite HID device.
     pub is_hid_interface: bool,
+
+    /// USB bus ID and device address, if known.
+    ///
+    /// Tells identical probes (same VID/PID, no serial number) apart while they stay plugged
+    /// in. It is not part of the string form of a [`DebugProbeSelector`].
+    pub usb_location: Option<(String, u8)>,
 
     /// A reference to the [`ProbeFactory`] that created this info object.
     probe_factory: &'static dyn ProbeFactory,
@@ -877,6 +1015,7 @@ impl DebugProbeInfo {
             probe_factory,
             interface,
             is_hid_interface,
+            usb_location: None,
         }
     }
 
@@ -901,351 +1040,6 @@ impl DebugProbeInfo {
     }
 }
 
-/// Bit-banging interface, ARM edition.
-///
-/// This trait (and [RawJtagIo], [JtagAccess]) should not be used by architecture implementations
-/// directly. Architectures should implement their own protocol interfaces, and use the raw probe
-/// interfaces (like [RawSwdIo]) to perform the low-level operations AS A FALLBACK. Probes like
-/// [CmsisDap] should prefer directly implementing the architecture protocols, if they have the
-/// capability.
-///
-/// Currently ARM implements this idea via [crate::architecture::arm::RawDapAccess], which
-/// is then implemented by [CmsisDap] or a fallback is provided for any probe that
-/// implements both `RawSwdIo` and [JtagAccess].
-///
-/// RISC-V is close with its [crate::architecture::riscv::dtm::DtmAccess] trait.
-///
-/// [CmsisDap]: crate::probe::cmsisdap::CmsisDap
-pub trait RawSwdIo: DebugProbe {
-    /// Drive a sequence of SWD I/O items and return the sampled bits.
-    fn swd_io<S>(&mut self, swdio: S) -> Result<Vec<bool>, DebugProbeError>
-    where
-        S: IntoIterator<Item = IoSequenceItem>;
-
-    /// Drive the CMSIS-DAP SWJ pins.
-    fn swj_pins(
-        &mut self,
-        pin_out: u32,
-        pin_select: u32,
-        pin_wait: u32,
-    ) -> Result<u32, DebugProbeError>;
-
-    /// Returns the SWD wire-protocol timing settings used by this probe.
-    fn swd_settings(&self) -> &SwdSettings;
-}
-
-/// A trait for implementing low-level JTAG interface operations.
-pub trait RawJtagIo: DebugProbe {
-    /// Returns a mutable reference to the current state.
-    fn state_mut(&mut self) -> &mut JtagDriverState;
-
-    /// Returns the current state.
-    fn state(&self) -> &JtagDriverState;
-
-    /// Shifts a number of bits through the TAP.
-    fn shift_bits(
-        &mut self,
-        tms: impl IntoIterator<Item = bool>,
-        tdi: impl IntoIterator<Item = bool>,
-        cap: impl IntoIterator<Item = bool>,
-    ) -> Result<(), DebugProbeError> {
-        for ((tms, tdi), cap) in tms.into_iter().zip(tdi.into_iter()).zip(cap.into_iter()) {
-            self.shift_bit(tms, tdi, cap)?;
-        }
-
-        Ok(())
-    }
-
-    /// Shifts a single bit through the TAP.
-    ///
-    /// Drivers may choose, and are encouraged, to buffer bits and flush them
-    /// in batches for performance reasons.
-    fn shift_bit(&mut self, tms: bool, tdi: bool, capture: bool) -> Result<(), DebugProbeError>;
-
-    /// Returns the bits captured from TDO and clears the capture buffer.
-    fn read_captured_bits(&mut self) -> Result<BitVec, DebugProbeError>;
-
-    /// Resets the JTAG state machine by shifting out a number of high TMS bits.
-    fn reset_jtag_state_machine(&mut self) -> Result<(), DebugProbeError> {
-        tracing::debug!("Resetting JTAG chain by setting tms high for 5 bits");
-
-        // Reset JTAG chain (5 times TMS high), and enter idle state afterwards
-        let tms = [true, true, true, true, true, false];
-        let tdi = std::iter::repeat(true);
-
-        self.shift_bits(tms, tdi, std::iter::repeat(false))?;
-        let response = self.read_captured_bits()?;
-
-        tracing::debug!("Response to reset: {response}");
-
-        Ok(())
-    }
-}
-
-/// One step of a [`RawSwdIo::swd_io`] sequence.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum IoSequenceItem {
-    /// Drive SWDIO to the given level for one clock.
-    Output(bool),
-    /// Sample SWDIO for one clock.
-    Input,
-}
-
-/// SWD wire-protocol timing settings used by [`RawSwdIo`] probes.
-#[derive(Debug)]
-pub struct SwdSettings {
-    /// Initial number of idle cycles between consecutive writes.
-    ///
-    /// When a WAIT response is received, the number of idle cycles
-    /// will be increased automatically, so this number can be quite
-    /// low.
-    pub num_idle_cycles_between_writes: usize,
-
-    /// How often a SWD transfer is retried when a WAIT response
-    /// is received.
-    pub num_retries_after_wait: usize,
-
-    /// When a SWD transfer is retried due to a WAIT response, the idle
-    /// cycle amount is doubled every time as a backoff. This sets a maximum
-    /// cap to the cycle amount.
-    pub max_retry_idle_cycles_after_wait: usize,
-
-    /// Number of idle cycles inserted before the result
-    /// of a write is checked.
-    ///
-    /// When performing a write operation, the write can
-    /// be buffered, meaning that completing the transfer
-    /// does not mean that the write was performed successfully.
-    ///
-    /// To check that all writes have been executed, the
-    /// `RDBUFF` register can be read from the DP.
-    ///
-    /// If any writes are still pending, this read will result in a WAIT response.
-    /// By adding idle cycles before performing this read, the chance of a
-    /// WAIT response is smaller.
-    pub idle_cycles_before_write_verify: usize,
-
-    /// Number of idle cycles to insert after a transfer
-    ///
-    /// It is recommended that at least 8 idle cycles are
-    /// inserted.
-    pub idle_cycles_after_transfer: usize,
-}
-
-impl Default for SwdSettings {
-    fn default() -> Self {
-        Self {
-            num_idle_cycles_between_writes: 2,
-            num_retries_after_wait: 1000,
-            max_retry_idle_cycles_after_wait: 128,
-            idle_cycles_before_write_verify: 8,
-            idle_cycles_after_transfer: 8,
-        }
-    }
-}
-
-/// The state of a bitbanging JTAG driver.
-///
-/// This struct tracks the state of the JTAG state machine,  which TAP is currently selected, and
-/// contains information about the system (like scan chain).
-#[derive(Debug)]
-pub struct JtagDriverState {
-    /// The state of the JTAG state machine.
-    pub state: JtagState,
-
-    /// The expected scan chain.
-    pub expected_scan_chain: Option<Vec<ScanChainElement>>,
-
-    /// The actual scan chain.
-    pub scan_chain: Vec<ScanChainElement>,
-
-    /// The parameters of the scan chain.
-    pub chain_params: ChainParams,
-
-    /// Idle cycles necessary between consecutive accesses to the DMI register.
-    pub jtag_idle_cycles: usize,
-}
-impl JtagDriverState {
-    fn max_ir_address(&self) -> u32 {
-        (1 << self.chain_params.irlen) - 1
-    }
-}
-
-impl Default for JtagDriverState {
-    fn default() -> Self {
-        Self {
-            state: JtagState::Reset,
-            expected_scan_chain: None,
-            scan_chain: Vec::new(),
-            chain_params: ChainParams::default(),
-            jtag_idle_cycles: 0,
-        }
-    }
-}
-
-/// Marker trait for bitbanging JTAG probes.
-///
-/// This trait exists to control which probes implement [`JtagAccess`]. In some cases,
-/// a probe may implement [`RawJtagIo`] but does not want an auto-implemented [JtagAccess].
-pub trait AutoImplementJtagAccess: RawJtagIo + 'static {}
-
-/// Low-Level access to the JTAG protocol
-///
-/// This trait should be implemented by all probes which offer low-level access to
-/// the JTAG protocol, i.e. direct control over the bytes sent and received.
-pub trait JtagAccess: DebugProbe {
-    /// Set the JTAG scan chain information for the target under debug.
-    ///
-    /// This allows the probe to know which TAPs are in the scan chain and their
-    /// position and IR lengths.
-    ///
-    /// If the scan chain is provided, and the selected protocol is JTAG, the
-    /// probe will use this information to validate that the scan chain is
-    /// what is expected.
-    ///
-    /// This is called by the `Session` when attaching to a target.
-    /// So this does not need to be called manually, unless you want to
-    /// modify the scan chain. You must be attached to a target to set the
-    /// scan_chain since the scan chain only applies to the attached target.
-    fn set_expected_scan_chain(
-        &mut self,
-        scan_chain: &[ScanChainElement],
-    ) -> Result<(), DebugProbeError>;
-
-    /// Set the JTAG scan chain information for the target under debug.
-    ///
-    /// If the scan chain is provided, and the selected protocol is JTAG, the
-    /// probe will automatically configure the JTAG interface to match the
-    /// scan chain configuration without trying to determine the chain at
-    /// runtime.
-    fn set_scan_chain(&mut self, scan_chain: &[ScanChainElement]) -> Result<(), DebugProbeError>;
-
-    /// Scans `IDCODE` and `IR` length information about the devices on the JTAG chain.
-    ///
-    /// If configured, this will use the data from [`Self::set_scan_chain`]. Otherwise, it
-    /// will try to measure and extract `IR` lengths by driving the JTAG interface.
-    ///
-    /// The measured scan chain will be stored in the probe's internal state.
-    fn scan_chain(&mut self) -> Result<&[ScanChainElement], DebugProbeError>;
-
-    /// Shifts a number of bits through the TAP.
-    fn shift_raw_sequence(&mut self, sequence: JtagSequence) -> Result<BitVec, DebugProbeError>;
-
-    /// Executes a TAP reset.
-    fn tap_reset(&mut self) -> Result<(), DebugProbeError>;
-
-    /// For RISC-V, and possibly other interfaces, the JTAG interface has to remain in
-    /// the idle state for several cycles between consecutive accesses to the DR register.
-    ///
-    /// This function configures the number of idle cycles which are inserted after each access.
-    fn set_idle_cycles(&mut self, idle_cycles: u8) -> Result<(), DebugProbeError>;
-
-    /// Return the currently configured idle cycles.
-    fn idle_cycles(&self) -> u8;
-
-    /// Selects the JTAG TAP to be used for communication.
-    ///
-    /// The index is the position of the TAP in the scan chain, which can
-    /// be configured using [`set_scan_chain()`](JtagAccess::set_scan_chain()).
-    fn select_target(&mut self, index: usize) -> Result<(), DebugProbeError> {
-        if index != 0 {
-            return Err(DebugProbeError::NotImplemented {
-                function_name: "select_jtag_tap",
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Read a JTAG register.
-    ///
-    /// This function emulates a read by performing a write with all zeros to the DR.
-    fn read_register(&mut self, address: u32, len: u32) -> Result<BitVec, DebugProbeError> {
-        let data = vec![0u8; len.div_ceil(8) as usize];
-
-        self.write_register(address, &data, len)
-    }
-
-    /// Write to a JTAG register
-    ///
-    /// This function will perform a write to the IR register, if necessary,
-    /// to select the correct register, and then to the DR register, to transmit the
-    /// data. The data shifted out of the DR register will be returned.
-    fn write_register(
-        &mut self,
-        address: u32,
-        data: &[u8],
-        len: u32,
-    ) -> Result<BitVec, DebugProbeError>;
-
-    /// Shift a value into the DR JTAG register
-    ///
-    /// The data shifted out of the DR register will be returned.
-    fn write_dr(&mut self, data: &[u8], len: u32) -> Result<BitVec, DebugProbeError>;
-
-    /// Executes a sequence of JTAG commands.
-    fn write_register_batch(
-        &mut self,
-        writes: &ErasedQueue,
-    ) -> Result<DeferredResultSet<CommandResult>, BatchExecutionError> {
-        tracing::debug!(
-            "Using default `JtagAccess::write_register_batch` hurts performance. Please implement proper batching for this probe."
-        );
-        let mut results = DeferredResultSet::new();
-
-        for (idx, write) in writes.iter() {
-            match write {
-                JtagCommand::WriteRegister(write) => {
-                    let response = match self.write_register(
-                        write.inner.address,
-                        &write.inner.data,
-                        write.inner.len,
-                    ) {
-                        Ok(response) => response,
-                        Err(e) => {
-                            return Err(BatchExecutionError::new_from_debug_probe(e, results));
-                        }
-                    };
-
-                    match (write.transform)(&write.inner, &response) {
-                        Ok(res) => results.push(idx, res),
-                        Err(e) => {
-                            return Err(BatchExecutionError::new_specific(e, results));
-                        }
-                    }
-                }
-
-                JtagCommand::ShiftDr(write) => {
-                    let response = match self.write_dr(&write.inner.data, write.inner.len) {
-                        Ok(response) => response,
-                        Err(e) => {
-                            return Err(BatchExecutionError::new_from_debug_probe(e, results));
-                        }
-                    };
-                    match (write.transform)(&write.inner, &response) {
-                        Ok(res) => results.push(idx, res),
-                        Err(e) => return Err(BatchExecutionError::new_specific(e, results)),
-                    }
-                }
-            }
-        }
-
-        Ok(results)
-    }
-}
-
-/// A raw JTAG bit sequence.
-pub struct JtagSequence {
-    /// TDO capture
-    pub tdo_capture: bool,
-
-    /// TMS value
-    pub tms: bool,
-
-    /// Data to generate on TDI
-    pub data: BitVec,
-}
-
 /// Data for a JTAG register write
 #[derive(Debug, Clone)]
 pub struct JtagWriteData {
@@ -1253,20 +1047,20 @@ pub struct JtagWriteData {
     pub address: u32,
 
     /// The data to be written to DR.
-    pub data: Vec<u8>,
+    pub data: BitSequence,
 
-    /// The number of bits in `data`
-    pub len: u32,
+    /// TCK cycles in Run-Test/Idle after the DR exchange.
+    pub idle_cycles: u32,
 }
 
 /// Data for a DR shift - no transform, just the payload.
 #[derive(Debug, Clone)]
 pub struct ShiftDrData {
     /// The data to be written to DR.
-    pub data: Vec<u8>,
+    pub data: BitSequence,
 
-    /// The number of bits in `data`
-    pub len: u32,
+    /// TCK cycles in Run-Test/Idle after the DR exchange.
+    pub idle_cycles: u32,
 }
 
 /// A typed JTAG register write command with compile-time error type.
@@ -1322,14 +1116,14 @@ impl<E: std::error::Error + Send + Sync + 'static> From<ShiftDrCommand<E>> for J
 }
 
 /// Type alias for the erased transform function used in batched JTAG commands.
-pub(crate) type ErasedTransformFn<T> = Box<
+pub type ErasedTransformFn<T> = Box<
     dyn Fn(&T, &BitSlice) -> Result<CommandResult, Box<dyn std::error::Error + Send + Sync>>
         + Send
         + Sync,
 >;
 
-/// An erased JTAG register write command (internal use).
-pub(crate) struct ErasedCommand<T> {
+/// An erased JTAG register write command.
+pub struct ErasedCommand<T> {
     /// The inner data for the write command.
     pub inner: T,
 
@@ -1348,7 +1142,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for ErasedCommand<T> {
 
 /// A low-level JTAG command (uses type-erased commands internally).
 #[derive(Debug)]
-pub(crate) enum JtagCommand {
+pub enum JtagCommand {
     /// Write a register.
     WriteRegister(ErasedCommand<JtagWriteData>),
     /// Shift a value into the DR register.
@@ -1364,53 +1158,6 @@ impl From<ErasedCommand<JtagWriteData>> for JtagCommand {
 impl From<ErasedCommand<ShiftDrData>> for JtagCommand {
     fn from(cmd: ErasedCommand<ShiftDrData>) -> Self {
         JtagCommand::ShiftDr(cmd)
-    }
-}
-
-/// Chain parameters to select a target tap within the chain.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ChainParams {
-    /// The TAP's position in the chain.
-    pub index: usize,
-
-    /// IR bits to shift before the TAP.
-    pub irpre: usize,
-
-    /// IR bits to shift after the TAP.
-    pub irpost: usize,
-
-    /// DR bits to shift before the TAP.
-    pub drpre: usize,
-
-    /// DR bits to shift after the TAP.
-    pub drpost: usize,
-
-    /// Length of the instruction register.
-    pub irlen: usize,
-}
-
-impl ChainParams {
-    fn from_jtag_chain(chain: &[ScanChainElement], selected: usize) -> Option<Self> {
-        let mut params = Self {
-            index: selected,
-            ..Default::default()
-        };
-        let mut found = false;
-        for (index, tap) in chain.iter().enumerate() {
-            let ir_len = tap.ir_len() as usize;
-            if index == selected {
-                params.irlen = ir_len;
-                found = true;
-            } else if found {
-                params.irpost += ir_len;
-                params.drpost += 1;
-            } else {
-                params.irpre += ir_len;
-                params.drpre += 1;
-            }
-        }
-
-        found.then_some(params)
     }
 }
 
@@ -1489,5 +1236,28 @@ mod test {
 
         assert!(probe_info.is_probe_type::<ftdi::FtdiProbeFactory>());
         assert!(!probe_info.is_probe_type::<jlink::JLinkFactory>());
+    }
+
+    #[test]
+    fn reset_line_blocks_only_asserts() {
+        let mut nreset = swd::Pins(0);
+        nreset.set_nreset(true);
+        let low = swd::Pins(0);
+        let mut line = ResetLine::default();
+        line.check_assert().unwrap();
+        line.check_pins(low, nreset).unwrap();
+
+        line.set_connected(false);
+        assert!(matches!(
+            line.check_assert(),
+            Err(DebugProbeError::ResetLineNotConnected)
+        ));
+        assert!(matches!(
+            line.check_pins(low, nreset),
+            Err(DebugProbeError::ResetLineNotConnected)
+        ));
+        // Release, and pins without nRESET, stay possible.
+        line.check_pins(nreset, nreset).unwrap();
+        line.check_pins(low, low).unwrap();
     }
 }

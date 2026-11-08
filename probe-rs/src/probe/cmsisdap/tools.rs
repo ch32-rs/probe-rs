@@ -2,10 +2,16 @@ use super::CmsisDapDevice;
 use crate::probe::{
     BoxedProbeError, DebugProbeInfo, DebugProbeSelector, ProbeCreationError,
     cmsisdap::{CmsisDapFactory, commands::CmsisDapError, commands::DEFAULT_USB_TIMEOUT},
+    list::{ProbeListItem, usb_probe_accessibility},
 };
 #[cfg(feature = "cmsisdap_v1")]
 use hidapi::HidApi;
-use nusb::{DeviceInfo, MaybeFuture, descriptors::TransferType, transfer::Direction};
+use nusb::{
+    DeviceInfo, MaybeFuture,
+    descriptors::TransferType,
+    transfer::{Bulk, Direction, In, Out},
+};
+use std::io;
 
 const USB_CLASS_HID: u8 = 0x03;
 const USB_CMSIS_DAP_CLASS: u8 = 0xFF;
@@ -17,13 +23,23 @@ const USB_CMSIS_DAP_SUBCLASS: u8 = 0;
 /// to permission or driver errors, so it falls back to listing only
 /// HID devices if it does not find any suitable devices.
 #[tracing::instrument(skip_all)]
-pub fn list_cmsisdap_devices() -> Vec<DebugProbeInfo> {
+pub fn list_cmsisdap_devices() -> Vec<ProbeListItem> {
     tracing::debug!("Searching for CMSIS-DAP probes using nusb");
 
     #[cfg_attr(not(feature = "cmsisdap_v1"), expect(unused_mut))]
-    let mut probes = match nusb::list_devices().wait() {
+    let mut probes: Vec<ProbeListItem> = match nusb::list_devices().wait() {
         Ok(devices) => devices
-            .flat_map(|device| get_cmsisdap_info(&device, false))
+            .flat_map(|device| {
+                // A single USB device can yield multiple entries (v1/v2 interfaces); give each
+                // entry the same accessibility for that device.
+                let accessibility = usb_probe_accessibility(&device);
+                get_cmsisdap_info(&device, false)
+                    .into_iter()
+                    .map(move |info| ProbeListItem {
+                        info,
+                        accessibility,
+                    })
+            })
             .collect(),
         Err(e) => {
             tracing::warn!("error listing devices with nusb: {e}");
@@ -42,13 +58,14 @@ pub fn list_cmsisdap_devices() -> Vec<DebugProbeInfo> {
         for device in api.device_list() {
             if let Some(info) = get_cmsisdap_hid_info(device) {
                 if !probes.iter().any(|p| {
-                    p.vendor_id == info.vendor_id
-                        && p.product_id == info.product_id
-                        && p.serial_number.as_deref().unwrap_or("")
+                    p.info.vendor_id == info.vendor_id
+                        && p.info.product_id == info.product_id
+                        && p.info.serial_number.as_deref().unwrap_or("")
                             == info.serial_number.as_deref().unwrap_or("")
                 }) {
                     tracing::trace!("Adding new HID-only probe {:?}", info);
-                    probes.push(info)
+                    // HID-only probes are not opened over usbfs, so the access check doesn't apply.
+                    probes.push(ProbeListItem::accessible(info))
                 } else {
                     tracing::trace!("Ignoring duplicate {:?}", info);
                 }
@@ -87,18 +104,47 @@ fn get_cmsisdap_info(device: &DeviceInfo, list_both_versions: bool) -> Vec<Debug
     // 2. Any that are HID, if the product string says CMSIS-DAP,
     //    to save for potential HID-only operation.
     for interface in device.interfaces() {
-        let Some(interface_desc) = interface.interface_string() else {
+        let interface_desc = interface.interface_string().map(str::to_owned).or_else(|| {
+            // Windows may omit interface strings for devices bound directly to
+            // WinUSB, in which case nusb can fetch it from the device.
+            if (interface.class(), interface.subclass())
+                == (USB_CMSIS_DAP_CLASS, USB_CMSIS_DAP_SUBCLASS)
+            {
+                interface.get_interface_string().wait().ok().flatten()
+            } else {
+                None
+            }
+        });
+
+        // An interface qualifies by its own string. An interface with no string
+        // at all qualifies only for a device in the known list, because a
+        // stringless vendor-specific interface is not otherwise distinguishable
+        // from an unrelated one that happens to sit on the same device.
+        let qualifies = match interface_desc.as_deref() {
+            Some(desc) => is_cmsis_dap(desc),
+            None => {
+                is_known_cmsis_dap_dev(device)
+                    && (interface.class(), interface.subclass())
+                        == (USB_CMSIS_DAP_CLASS, USB_CMSIS_DAP_SUBCLASS)
+            }
+        };
+
+        if !qualifies {
             tracing::trace!(
-                "interface {} has no string, skipping",
-                interface.interface_number()
+                "interface {} ({:?}, class {:#04x}, subclass {:#04x}) is not CMSIS-DAP, skipping",
+                interface.interface_number(),
+                interface_desc,
+                interface.class(),
+                interface.subclass(),
             );
             continue;
-        };
-        if is_cmsis_dap(interface_desc) {
+        }
+
+        {
             tracing::trace!(
                 "  Interface {}: {}",
                 interface.interface_number(),
-                interface_desc,
+                interface_desc.as_deref().unwrap_or("<no interface string>"),
             );
             let selected_interface = Some(interface.interface_number());
             let is_hid_interface = if interface.class() == USB_CLASS_HID {
@@ -236,18 +282,27 @@ pub fn open_v2_device(
             continue;
         }
         for i_desc in interface.alt_settings() {
-            // Skip interfaces without "CMSIS-DAP" like pattern in their string
-            let Some(interface_str) = device_info
+            // Skip interfaces without "CMSIS-DAP" like pattern in their string. An interface
+            // with no string at all is accepted only for a device in the known list; see
+            // `is_known_cmsis_dap_dev`. The endpoint checks below remain the real gate.
+            let interface_str = device_info
                 .interfaces()
                 .find(|i| i.interface_number() == interface.interface_number())
-                .and_then(|i| i.interface_string())
-            else {
-                tracing::trace!("Interface does not have interface string");
-                continue;
-            };
-            if !is_cmsis_dap(interface_str) {
-                tracing::trace!("Interface does not have 'CMSIS-DAP' in string");
-                continue;
+                .and_then(|i| i.get_interface_string().wait().ok().flatten());
+
+            match interface_str.as_deref() {
+                Some(interface_str) if is_cmsis_dap(interface_str) => {}
+                Some(_) => {
+                    tracing::trace!("Interface does not have 'CMSIS-DAP' in string");
+                    continue;
+                }
+                None if is_known_cmsis_dap_dev(device_info) => {
+                    tracing::trace!("Interface has no string; accepting it as a known device");
+                }
+                None => {
+                    tracing::trace!("Interface does not have interface string");
+                    continue;
+                }
             }
 
             // Skip interfaces without 2 or 3 endpoints
@@ -276,14 +331,19 @@ pub fn open_v2_device(
             }
 
             // Detect a third bulk EP which will be for SWO streaming
-            let mut swo_ep = None;
+            let mut swo_ep_addr = None;
 
             if eps.len() > 2
                 && eps[2].transfer_type() == TransferType::Bulk
                 && eps[2].direction() == Direction::In
             {
-                swo_ep = Some((eps[2].address(), eps[2].max_packet_size()));
+                swo_ep_addr = Some(eps[2].address());
             }
+
+            let out_ep_addr = eps[0].address();
+            let in_ep_addr = eps[1].address();
+            let max_packet_size = eps[1].max_packet_size();
+
             // Attempt to claim this interface
             match device.claim_interface(interface.interface_number()).wait() {
                 Ok(handle) => {
@@ -293,12 +353,31 @@ pub fn open_v2_device(
                         device_info.product_id(),
                         device_info.device_version(),
                     )?;
+
+                    // Claim the bulk endpoints once and keep them for the
+                    // lifetime of the device, so transfers don't pay the
+                    // per-call endpoint setup/teardown cost.
+                    let out_ep = handle
+                        .endpoint::<Bulk, Out>(out_ep_addr)
+                        .map_err(|e| ProbeCreationError::Usb(io::Error::from(e)))?;
+                    let in_ep = handle
+                        .endpoint::<Bulk, In>(in_ep_addr)
+                        .map_err(|e| ProbeCreationError::Usb(io::Error::from(e)))?;
+                    let swo_ep = match swo_ep_addr {
+                        Some(addr) => Some(
+                            handle
+                                .endpoint::<Bulk, In>(addr)
+                                .map_err(|e| ProbeCreationError::Usb(io::Error::from(e)))?,
+                        ),
+                        None => None,
+                    };
+
                     return Ok(Some(CmsisDapDevice::V2 {
                         handle,
-                        out_ep: eps[0].address(),
-                        in_ep: eps[1].address(),
+                        out_ep,
+                        in_ep,
                         swo_ep,
-                        max_packet_size: eps[1].max_packet_size(),
+                        max_packet_size,
                         usb_timeout: DEFAULT_USB_TIMEOUT,
                     }));
                 }
@@ -489,7 +568,9 @@ fn is_cmsis_dap(id: &str) -> bool {
 fn is_known_cmsis_dap_dev(device: &DeviceInfo) -> bool {
     // - 1a86:8012 WCH-Link in DAP mode, This shares the same description string as the
     //   WCH-Link in RV mode, so we have to check by vendor ID and product ID.
-    const KNOWN_DAPS: &[(u16, u16)] = &[(0x1a86, 0x8012)];
+    // - 1366:1080 SEGGER J-Link in CMSIS-DAP mode. It names itself "J-Link CMSIS-DAP"
+    //   but omits the interface string that the CMSIS-DAP v2 spec recommends.
+    const KNOWN_DAPS: &[(u16, u16)] = &[(0x1a86, 0x8012), (0x1366, 0x1080)];
 
     KNOWN_DAPS
         .iter()
@@ -510,9 +591,12 @@ fn is_known_cmsis_dap_dev(device: &DeviceInfo) -> bool {
 #[cfg(feature = "cmsisdap_v1")]
 fn hid_report_size(device: &hidapi::DeviceInfo) -> usize {
     // EDBG are 512-bytes and don't respond until you give them 512 bytes.
+    // The nEDBG on the Curiosity Nano boards also says "EDBG" in its
+    // product string ("nEDBG CMSIS-DAP"), but its reports are the usual
+    // 64 bytes.
     if device.vendor_id() == 0x03eb
         && let Some(s) = device.product_string()
-        && s.contains("EDBG")
+        && s.starts_with("EDBG")
     {
         tracing::debug!("Overriding packet size to 512 bytes for EDBG device");
         return 512;

@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use nusb::{Interface, MaybeFuture, descriptors::TransferType, transfer::Direction};
 
 use crate::probe::{
@@ -93,7 +91,7 @@ impl WchLinkUsbDevice {
         let mut rxbuf = [0u8; 64];
         let len = cmd.to_bytes(&mut rxbuf)?;
 
-        let timeout = Duration::from_millis(100);
+        let timeout = C::TIMEOUT;
 
         let written_bytes = self
             .device_handle
