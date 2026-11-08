@@ -21,6 +21,7 @@ chip_detection:
     0x610600: CH32V006E8R6
     0x620600: CH32V006F8U6
     0x630600: CH32V006F8P6
+    0x640600: CH32V006F4U6
     0x710600: CH32V007E8R6
     0x720600: CH32V007K8U6
 variants:
@@ -1159,6 +1160,69 @@ variants:
   - ch32-v00x-sys
   - ch32-v00x-opt
 - name: CH32V006F8P6
+  cores:
+  - name: main
+    type: riscv
+    core_access_options: !Riscv
+      hart_id: 0
+  memory_map:
+  - !Nvm
+    name: USR_LEGACY
+    range:
+      start: 0x0
+      end: 0xf800
+    cores:
+    - main
+    is_alias: true
+  - !Nvm
+    name: USR
+    range:
+      start: 0x8000000
+      end: 0x800f800
+    cores:
+    - main
+  - !Nvm
+    name: SYS
+    range:
+      start: 0x1fff0000
+      end: 0x1fff0d00
+    cores:
+    - main
+    is_alias: true
+  - !Nvm
+    name: VND
+    range:
+      start: 0x1ffff700
+      end: 0x1ffff800
+    cores:
+    - main
+    is_alias: true
+    access:
+      write: false
+      execute: false
+  - !Nvm
+    name: OPT
+    range:
+      start: 0x1ffff800
+      end: 0x1ffff900
+    cores:
+    - main
+    is_alias: true
+    access:
+      execute: false
+  - !Ram
+    name: RAM
+    range:
+      start: 0x20000000
+      end: 0x20002000
+    cores:
+    - main
+  flash_algorithms:
+  - ch32-v00x-usr
+  - ch32-v00x-usr-legacy
+  - ch32-v00x-sys
+  - ch32-v00x-opt
+- name: CH32V006F4U6
   cores:
   - name: main
     type: riscv
